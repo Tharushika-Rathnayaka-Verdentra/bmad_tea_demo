@@ -103,6 +103,10 @@ export class TestRailClient {
     return this.post<TestRailCase>(`add_case/${sectionId}`, { title, ...(refs ? { refs } : {}) });
   }
 
+  async updateCaseRefs(caseId: number, refs: string): Promise<TestRailCase> {
+    return this.post<TestRailCase>(`update_case/${caseId}`, { refs });
+  }
+
   async addRun(name: string, description: string, caseIds: number[]): Promise<TestRailRun> {
     return this.post<TestRailRun>(`add_run/${this.config.projectId}`, {
       name,

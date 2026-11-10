@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import process from 'node:process';
 import type { FullConfig, FullResult, Reporter, Suite, TestCase, TestResult } from '@playwright/test/reporter';
-import { info, warn } from './http-client';
+import { HttpError, info, warn } from './http-client';
 import { adf, JiraClient, type JiraConfig } from './jira-client';
 import { TESTRAIL_STATUS, TestRailClient, type TestRailConfig, type TestRailResultInput } from './testrail-client';
 
@@ -48,6 +48,18 @@ const env = (name: string, fallback = ''): string => (process.env[name] ?? fallb
 const flag = (name: string): boolean => !['false', '0', 'no', 'off'].includes(env(name, 'true').toLowerCase());
 const optIn = (name: string): boolean => ['true', '1', 'yes', 'on'].includes(env(name).toLowerCase());
 const intOrUndefined = (value: string): number | undefined => (value && /^\d+$/.test(value) ? Number(value) : undefined);
+
+const TESTRAIL_CREDENTIAL_VARS = ['TESTRAIL_INSTANCE_URL', 'TESTRAIL_USERNAME', 'TESTRAIL_API_KEY'] as const;
+
+// playwright.config.ts only loads `.env`; a populated `.env.example` alone is the most common reason the sync is skipped.
+function testRailSkipReason(): string {
+  if (!flag('TESTRAIL_ENABLED')) {
+    return 'TESTRAIL_ENABLED is false.';
+  }
+  const missing = TESTRAIL_CREDENTIAL_VARS.filter((name) => !env(name));
+  const hint = !existsSync('.env') && existsSync('.env.example') ? ' No .env file found: copy .env.example to .env and fill in the values.' : '';
+  return `missing ${missing.join(', ')}.${hint}`;
+}
 
 function loadTestRailConfig(): TestRailConfig | undefined {
   const instanceUrl = env('TESTRAIL_INSTANCE_URL');
@@ -152,10 +164,10 @@ export default class TestRailJiraReporter implements Reporter {
     this.lastResults.set(test.id, result);
   }
 
-  async onEnd(_result: FullResult): Promise<void> {
+  async onEnd(_result: FullResult): Promise<{ status?: FullResult['status'] } | undefined> {
     const tests = this.collect();
     if (tests.length === 0) {
-      return;
+      return undefined;
     }
 
     const manifest: SyncManifest = {
@@ -179,7 +191,7 @@ export default class TestRailJiraReporter implements Reporter {
       manifest.testrail.suiteId = testRailConfig.suiteId;
     }
     if (!testRail) {
-      info('TestRail sync skipped: set TESTRAIL_INSTANCE_URL, TESTRAIL_USERNAME and TESTRAIL_API_KEY to enable.');
+      info(`TestRail sync skipped: ${testRailSkipReason()}`);
     }
     if (!jira) {
       info('Jira defect sync skipped: set JIRA_BASE_URL, JIRA_EMAIL and JIRA_API_TOKEN to enable.');
@@ -196,6 +208,9 @@ export default class TestRailJiraReporter implements Reporter {
         manifest.testrail.runUrl = testRail.runUrl(runId);
       } catch (error) {
         warn('TestRail case/run sync failed.', error);
+        if (error instanceof HttpError && error.status === 403) {
+          warn('The TestRail user needs a role that can add sections and cases (e.g. Lead) in the target project, or pin tests to existing cases with @C<id>.');
+        }
         manifest.sync.testrail = 'failed';
       }
     }
@@ -226,6 +241,14 @@ export default class TestRailJiraReporter implements Reporter {
 
     this.writeManifest(manifest);
     info(`Sync manifest written to ${this.manifestPath}`);
+
+    // TESTRAIL_REQUIRED turns "results must land in a TestRail run" into a hard contract:
+    // a green suite whose results never reached TestRail is reported as a failed run.
+    if (optIn('TESTRAIL_REQUIRED') && manifest.sync.testrail !== 'done') {
+      warn(`TESTRAIL_REQUIRED is set but TestRail sync status is "${manifest.sync.testrail}"; marking the run as failed.`);
+      return { status: 'failed' };
+    }
+    return undefined;
   }
 
   private collect(): CollectedTest[] {
@@ -255,7 +278,8 @@ export default class TestRailJiraReporter implements Reporter {
         line: test.location.line,
         project,
         explicitCaseId,
-        refs: test.title.match(/\b\d+\.\d+-[A-Z]+-\d+\b/)?.[0],
+        // Plan ids such as 1.0-E2E-001 or 2.3-API-004; the level token may contain digits (E2E).
+        refs: test.title.match(/\b\d+\.\d+-[A-Z][A-Z0-9]*-\d+\b/)?.[0],
         outcome: toOutcome(test),
         durationMs: test.results.reduce((total, run) => total + run.duration, 0),
         attempts: test.results.length,
@@ -276,24 +300,29 @@ export default class TestRailJiraReporter implements Reporter {
   private async syncCasesAndRun(testRail: TestRailClient, tests: CollectedTest[]): Promise<number> {
     const section = await testRail.ensureSection(this.sectionName);
     const existingCases = await testRail.getCasesInSection(section.id);
-    const byTitle = new Map(existingCases.map((testCase) => [testCase.title, testCase.id]));
+    const byTitle = new Map(existingCases.map((testCase) => [testCase.title, testCase]));
     let created = 0;
+    let updated = 0;
 
     for (const test of tests) {
       if (test.explicitCaseId) {
         test.caseId = test.explicitCaseId;
         continue;
       }
-      let caseId = byTitle.get(test.caseTitle);
-      if (!caseId) {
-        const newCase = await testRail.addCase(section.id, test.caseTitle, test.refs);
-        caseId = newCase.id;
-        byTitle.set(test.caseTitle, caseId);
+      let existing = byTitle.get(test.caseTitle);
+      if (!existing) {
+        existing = await testRail.addCase(section.id, test.caseTitle, test.refs);
+        byTitle.set(test.caseTitle, existing);
         created += 1;
+      } else if (test.refs && !existing.refs) {
+        // Backfill traceability refs on cases created before the test carried a plan id.
+        await testRail.updateCaseRefs(existing.id, test.refs);
+        existing.refs = test.refs;
+        updated += 1;
       }
-      test.caseId = caseId;
+      test.caseId = existing.id;
     }
-    info(`TestRail cases mapped: ${tests.length} (${created} created in section "${this.sectionName}").`);
+    info(`TestRail cases mapped: ${tests.length} (${created} created, ${updated} refs updated in section "${this.sectionName}").`);
 
     const caseIds = [...new Set(tests.map((test) => test.caseId!).filter(Boolean))];
     const reuseRunId = intOrUndefined(env('TESTRAIL_RUN_ID'));

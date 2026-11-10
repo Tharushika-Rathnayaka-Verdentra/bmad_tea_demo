@@ -2,7 +2,7 @@
 
 ## Setup
 
-Use Node.js 26 and install dependencies with `npm install`. Install the browser once with `npx playwright install chromium`. Copy `.env.example` to `.env` only when overriding the default target URL.
+Use Node.js 26 and install dependencies with `npm install`. Install the browser once with `npx playwright install chromium`. Copy `.env.example` to `.env` to override the default target URL or to enable TestRail/Jira reporting; `playwright.config.ts` loads only `.env`, so values left in `.env.example` are never read. `.env` is gitignored — keep API keys there and never in `.env.example`.
 
 The default `BASE_URL` is `https://todomvc.com/examples/react/dist/`. The root `playwright.config.ts` reads `BASE_URL` from the process environment; `TEST_ENV` and `API_URL` are reserved for later environment-specific setup.
 
@@ -41,7 +41,7 @@ Jobs:
 
 - **burn-in** (pull requests only) diffs the PR against its base, and runs any added or modified `tests/**/*.spec.ts` five times with retries disabled via `npm run test:burn-in`. It is skipped when no spec changed.
 - **e2e** runs the full suite in two shards with `fail-fast: false`, using the blob reporter so results can be merged.
-- **report** merges the shard blobs into the HTML and JUnit reports defined in `playwright.config.ts`, uploads them as `playwright-report` and `junit-results` (30-day retention), and fails if any shard failed.
+- **report** merges the shard blobs into the HTML and JUnit reports defined in `playwright.config.ts`, verifies the TestRail/Jira sync manifest (see below), uploads the reports as `playwright-report` and `junit-results` (30-day retention), and fails if any shard failed.
 
 The config already sets `forbidOnly`, `retries: 2`, and `workers: 1` when `CI` is set. No secrets are required; `BASE_URL` defaults to the public TodoMVC site. Override it with a repository variable or workflow `env` entry when pointing at another environment.
 
@@ -63,9 +63,11 @@ Shard count is set in the workflow `SHARD_TOTAL` env and matrix; raise both toge
 2. When TestRail credentials are set, ensures the section `TESTRAIL_SECTION_NAME` exists in project `TESTRAIL_PROJECT_ID`, looks up each test case by its cleaned title and **creates missing cases**, creates a run (or reuses `TESTRAIL_RUN_ID`), and posts results: passed → Passed, failed → Failed, flaky → Retest (`TESTRAIL_FLAKY_STATUS_ID`), skipped → untested unless `TESTRAIL_SKIPPED_STATUS_ID` is set. Failure screenshots are attached to the result.
 3. When Jira credentials are set, **raises a `JIRA_ISSUE_TYPE` in `JIRA_PROJECT_KEY` for each failed test**. Each test carries a stable label (`pw-test-<hash>`); if an open issue with that label already exists the reporter comments on it instead of creating a duplicate. The Jira key is written into the TestRail result's `defects` field.
 
-Credentials come from `.env` locally (see `.env.example`) or from repository secrets in CI. Variable names match the TestRail MCP server, so one `.env` configures both. The reporter never fails the test run: sync errors are logged with a `[testrail-jira-reporter]` prefix and recorded in the manifest's `sync` block.
+Credentials come from `.env` locally (see `.env.example`) or from repository secrets in CI. Variable names match the TestRail MCP server, so one `.env` configures both. `JIRA_BASE_URL` is the Jira site URL (for example `https://your-site.atlassian.net`), not the Atlassian MCP endpoint. The TestRail user must hold a role that can add sections and cases in the target project (the default **Tester** role cannot; **Lead** can) — otherwise the sync fails with HTTP 403 on `add_section`/`add_case`. `TESTRAIL_SECTION_NAME` is a *section* inside project `TESTRAIL_PROJECT_ID`, not the project name; it is created on first use.
 
-Case mapping: the default is lookup-by-title with auto-create. Pin a test to an existing case by putting `@C123` in its title or adding `test.info().annotations.push({ type: 'testrail', description: 'C123' })`. `@tags` are stripped from the case title; a test id such as `1.0-E2E-001` is copied into the case `refs` field.
+By default the reporter never fails the test run: sync errors are logged with a `[testrail-jira-reporter]` prefix and recorded in the manifest's `sync` block. Set `TESTRAIL_REQUIRED=true` to make results landing in a TestRail run a hard contract — the Playwright run then exits non-zero whenever `sync.testrail` is not `done` (credentials missing, `TESTRAIL_ENABLED=false`, or an API error). In CI, the `report` job's "Verify TestRail/Jira sync succeeded" step reads the manifest's `sync` block and fails the job when credentials for a system were supplied but its sync did not end in `done`, so a broken integration cannot hide behind a green run.
+
+Case mapping: the default is lookup-by-title with auto-create. Pin a test to an existing case by putting `@C123` in its title or adding `test.info().annotations.push({ type: 'testrail', description: 'C123' })`. `@tags` are stripped from the case title; a test id such as `1.0-E2E-001` is copied into the case `refs` field, and backfilled onto existing cases whose `refs` is empty.
 
 In CI the reporter runs once, in the `report` job, over the merged shard results. Shards use the blob reporter and burn-in has no secrets, so neither pushes to TestRail. Pull requests report results to TestRail but do not raise Jira defects (`JIRA_ENABLED` is false for `pull_request` events); change that expression in `.github/workflows/e2e-tests.yml` if PR failures should also file bugs. Required secrets: `TESTRAIL_INSTANCE_URL`, `TESTRAIL_USERNAME`, `TESTRAIL_API_KEY`, `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`. Optional repository variables: `TESTRAIL_PROJECT_ID`, `TESTRAIL_SUITE_ID`, `TESTRAIL_SECTION_NAME`, `JIRA_PROJECT_KEY`.
 
@@ -77,7 +79,7 @@ Jira support targets Jira Cloud (REST v3, ADF payloads, `/search/jql`).
 
 | Stack | MCP server | Transport | Auth |
 | --- | --- | --- | --- |
-| Playwright | `@playwright/mcp` | stdio via `npx` | none |
+| Playwright | `@playwright/mcp` (pinned) | stdio via `npx` | none |
 | TestRail | `@uarlouski/testrail-mcp-server` | stdio via `npx` | prompted on first start (`TESTRAIL_INSTANCE_URL`, `TESTRAIL_USERNAME`, `TESTRAIL_API_KEY`); the API key is stored by VS Code as a secret, not in the file |
 | Jira | Atlassian Rovo MCP Server `https://mcp.atlassian.com/v2/mcp` | HTTP | OAuth 2.1 sign-in in the browser |
 

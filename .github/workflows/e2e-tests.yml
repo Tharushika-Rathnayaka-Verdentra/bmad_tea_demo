@@ -132,18 +132,48 @@ jobs:
         # It skips TestRail/Jira silently when the secrets are not configured.
         run: npm run test:ci:merge -- all-blob-reports
         env:
-          TESTRAIL_INSTANCE_URL: ${{ secrets.TESTRAIL_INSTANCE_URL }}
-          TESTRAIL_USERNAME: ${{ secrets.TESTRAIL_USERNAME }}
-          TESTRAIL_API_KEY: ${{ secrets.TESTRAIL_API_KEY }}
-          TESTRAIL_PROJECT_ID: ${{ vars.TESTRAIL_PROJECT_ID || '1' }}
-          TESTRAIL_SUITE_ID: ${{ vars.TESTRAIL_SUITE_ID }}
-          TESTRAIL_SECTION_NAME: ${{ vars.TESTRAIL_SECTION_NAME || 'Playwright Automation' }}
-          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
-          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
-          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-          JIRA_PROJECT_KEY: ${{ vars.JIRA_PROJECT_KEY || 'BMAD' }}
+          TESTRAIL_INSTANCE_URL: process.env.TESTRAIL_INSTANCE_URL
+          TESTRAIL_USERNAME: process.env.TESTRAIL_USERNAME
+          TESTRAIL_API_KEY: process.env.TESTRAIL_API_KEY
+          TESTRAIL_PROJECT_ID: process.env.TESTRAIL_PROJECT_ID
+          TESTRAIL_SUITE_ID: process.env.TESTRAIL_SUITE_ID
+          TESTRAIL_SECTION_NAME: process.env.TESTRAIL_SECTION_NAME || 'Playwright Automation'
+          JIRA_BASE_URL: process.env.JIRA_BASE_URL
+          JIRA_EMAIL: process.env.JIRA_EMAIL
+          JIRA_API_TOKEN: process.env.JIRA_API_TOKEN
+          JIRA_PROJECT_KEY: process.env.JIRA_PROJECT_KEY
           # Pull requests only report to TestRail; defects are raised for master and nightly runs.
-          JIRA_ENABLED: ${{ github.event_name != 'pull_request' }}
+          JIRA_ENABLED: process.env.JIRA_ENABLED || (process.env.GITHUB_EVENT_NAME != 'pull_request')
+
+      - name: Verify TestRail/Jira sync succeeded
+        # The reporter never fails the run itself; this step makes a broken sync visible
+        # whenever the credentials for that system were supplied.
+        run: |
+          node -e '
+            const fs = require("fs");
+            const path = "test-results/testrail-jira-sync.json";
+            if (!fs.existsSync(path)) {
+              console.error("Sync manifest missing: " + path);
+              process.exit(1);
+            }
+            const { sync } = JSON.parse(fs.readFileSync(path, "utf8"));
+            const problems = [];
+            if (process.env.TESTRAIL_API_KEY && sync.testrail !== "done") {
+              problems.push("TestRail credentials were set but sync status is \"" + sync.testrail + "\"");
+            }
+            if (process.env.JIRA_API_TOKEN && process.env.JIRA_ENABLED === "true" && sync.jira !== "done") {
+              problems.push("Jira credentials were set but sync status is \"" + sync.jira + "\"");
+            }
+            if (problems.length) {
+              problems.forEach((p) => console.error("::error::" + p));
+              process.exit(1);
+            }
+            console.log("Sync status: testrail=" + sync.testrail + ", jira=" + sync.jira);
+          '
+        env:
+          TESTRAIL_API_KEY: process.env.TESTRAIL_API_KEY
+          JIRA_API_TOKEN: process.env.JIRA_API_TOKEN
+          JIRA_ENABLED: process.env.JIRA_ENABLED || (process.env.GITHUB_EVENT_NAME != 'pull_request')
 
       - name: Upload HTML report
         uses: actions/upload-artifact@v4
