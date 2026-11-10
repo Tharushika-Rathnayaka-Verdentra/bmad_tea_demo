@@ -1,0 +1,25 @@
+{
+  "name": "bmad_tea_demo",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "npm run test:e2e",
+    "test:e2e": "playwright test",
+    "test:e2e:headed": "playwright test --headed",
+    "test:e2e:debug": "playwright test --debug",
+    "test:ci": "playwright test --reporter=blob,list",
+    "test:ci:merge": "playwright merge-reports --config playwright.config.ts",
+    "test:all": "npm run test:e2e && npm run test:ci",
+    "test:burn-in": "playwright test --config tests/playwright.config.ts --repeat-each=5 --retries=0"
+  },
+  "keywords": [],
+  "type": "commonjs",
+  "devDependencies": {
+    "@faker-js/faker": "^10.6.0",
+    "@playwright/test": "^1.65.0",
+    "@seontechnologies/playwright-utils": "^4.6.1",
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  }
+}
