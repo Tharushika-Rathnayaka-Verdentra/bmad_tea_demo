@@ -1,19 +1,9 @@
 {
   "inputs": [
     {
-      "id": "testrail-instance-url",
+      "id": "testrail-api-key-v2",
       "type": "promptString",
-      "description": "TestRail instance URL, e.g. https://your-team.testrail.io"
-    },
-    {
-      "id": "testrail-username",
-      "type": "promptString",
-      "description": "TestRail username (email)"
-    },
-    {
-      "id": "testrail-api-key",
-      "type": "promptString",
-      "description": "TestRail API key (My Settings > API Keys)",
+      "description": "Enter your TestRail API key (required; do not leave blank)",
       "password": true
     }
   ],
@@ -26,11 +16,11 @@
     "testrail": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@uarlouski/testrail-mcp-server@latest"],
+      "args": ["-y", "--package", "@uarlouski/testrail-mcp-server@3.3.1", "testrail-mcp-server"],
       "env": {
-        "TESTRAIL_INSTANCE_URL": "${input:testrail-instance-url}",
-        "TESTRAIL_USERNAME": "${input:testrail-username}",
-        "TESTRAIL_API_KEY": "${input:testrail-api-key}"
+        "TESTRAIL_INSTANCE_URL": "https://bmadtesttharushikar.testrail.io",
+        "TESTRAIL_USERNAME": "tharushikar@verdentra.com",
+        "TESTRAIL_API_KEY": "${input:testrail-api-key-v2}"
       }
     },
     "atlassian": {
