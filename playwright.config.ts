@@ -17,6 +17,9 @@ export default defineConfig({
     ['html', { outputFolder: 'playwright-report', open: 'never' }],
     ['junit', { outputFile: 'test-results/junit.xml' }],
     ['list'],
+    // Syncs cases + results to TestRail and raises Jira defects when credentials are present;
+    // always writes test-results/testrail-jira-sync.json for MCP-driven sync by the TEA agent.
+    ['./tests/support/reporters/testrail-jira-reporter.ts', { manifestPath: 'test-results/testrail-jira-sync.json' }],
   ],
   timeout: 60_000,
   expect: { timeout: 10_000 },

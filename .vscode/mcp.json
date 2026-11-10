@@ -1,0 +1,41 @@
+{
+  "inputs": [
+    {
+      "id": "testrail-instance-url",
+      "type": "promptString",
+      "description": "TestRail instance URL, e.g. https://your-team.testrail.io"
+    },
+    {
+      "id": "testrail-username",
+      "type": "promptString",
+      "description": "TestRail username (email)"
+    },
+    {
+      "id": "testrail-api-key",
+      "type": "promptString",
+      "description": "TestRail API key (My Settings > API Keys)",
+      "password": true
+    }
+  ],
+  "servers": {
+    "playwright": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest"]
+    },
+    "testrail": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@uarlouski/testrail-mcp-server@latest"],
+      "env": {
+        "TESTRAIL_INSTANCE_URL": "${input:testrail-instance-url}",
+        "TESTRAIL_USERNAME": "${input:testrail-username}",
+        "TESTRAIL_API_KEY": "${input:testrail-api-key}"
+      }
+    },
+    "atlassian": {
+      "type": "http",
+      "url": "https://mcp.atlassian.com/v2/mcp"
+    }
+  }
+}

@@ -127,8 +127,23 @@ jobs:
           path: all-blob-reports/
           merge-multiple: true
 
-      - name: Merge into HTML and JUnit reports
+      - name: Merge into HTML and JUnit reports, sync TestRail and Jira
+        # The custom reporter in playwright.config.ts runs here once over the merged results.
+        # It skips TestRail/Jira silently when the secrets are not configured.
         run: npm run test:ci:merge -- all-blob-reports
+        env:
+          TESTRAIL_INSTANCE_URL: ${{ secrets.TESTRAIL_INSTANCE_URL }}
+          TESTRAIL_USERNAME: ${{ secrets.TESTRAIL_USERNAME }}
+          TESTRAIL_API_KEY: ${{ secrets.TESTRAIL_API_KEY }}
+          TESTRAIL_PROJECT_ID: ${{ vars.TESTRAIL_PROJECT_ID || '1' }}
+          TESTRAIL_SUITE_ID: ${{ vars.TESTRAIL_SUITE_ID }}
+          TESTRAIL_SECTION_NAME: ${{ vars.TESTRAIL_SECTION_NAME || 'Playwright Automation' }}
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_PROJECT_KEY: ${{ vars.JIRA_PROJECT_KEY || 'BMAD' }}
+          # Pull requests only report to TestRail; defects are raised for master and nightly runs.
+          JIRA_ENABLED: ${{ github.event_name != 'pull_request' }}
 
       - name: Upload HTML report
         uses: actions/upload-artifact@v4
@@ -144,6 +159,15 @@ jobs:
           path: test-results/junit.xml
           retention-days: 30
 
+      - name: Upload TestRail/Jira sync manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testrail-jira-sync
+          path: test-results/testrail-jira-sync.json
+          retention-days: 30
+          if-no-files-found: ignore
+
       - name: Summarize results
         run: |
           {
@@ -152,6 +176,10 @@ jobs:
             echo "- Shards: ${SHARD_TOTAL}"
             echo "- Outcome: ${E2E_RESULT}"
             echo "- Reports: see the \`playwright-report\` and \`junit-results\` artifacts on this run."
+            if [ -f test-results/testrail-jira-sync.json ]; then
+              echo "- TestRail run: $(node -p "require('./test-results/testrail-jira-sync.json').testrail.runUrl ?? 'not synced'")"
+              echo "- Jira defects: $(node -p "require('./test-results/testrail-jira-sync.json').jira.issues.map(i => i.key + ' (' + i.action + ')').join(', ') || 'none'")"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
         env:
           E2E_RESULT: ${{ needs.e2e.result }}
