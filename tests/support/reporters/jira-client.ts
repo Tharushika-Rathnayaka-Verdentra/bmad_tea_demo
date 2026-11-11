@@ -1,4 +1,5 @@
-import { basicAuthHeader, HttpError, requestJson, uploadFile } from './http-client';
+import process from 'node:process';
+import { basicAuthHeader, HttpError, requestJson, uploadFile, warn } from './http-client';
 
 export interface JiraConfig {
   baseUrl: string;
@@ -23,10 +24,10 @@ export const adf = {
     return { type: 'doc', version: 1, content };
   },
   heading(text: string, level = 3): AdfNode {
-    return { type: 'heading', attrs: { level }, content: [{ type: 'text', text }] };
+    return { type: 'heading', attrs: { level }, content: [{ type: 'text', text: text || ' ' }] };
   },
   paragraph(text: string): AdfNode {
-    return { type: 'paragraph', content: [{ type: 'text', text }] };
+    return { type: 'paragraph', content: [{ type: 'text', text: text || ' ' }] };
   },
   link(label: string, href: string): AdfNode {
     return {
@@ -35,17 +36,64 @@ export const adf = {
     };
   },
   bulletList(items: string[]): AdfNode {
-    return {
-      type: 'bulletList',
-      content: items.map((item) => ({
-        type: 'listItem',
-        content: [{ type: 'paragraph', content: [{ type: 'text', text: item }] }],
-      })),
-    };
+    return { type: 'bulletList', content: listItems(items) };
+  },
+  orderedList(items: string[]): AdfNode {
+    return { type: 'orderedList', attrs: { order: 1 }, content: listItems(items) };
   },
   codeBlock(text: string, language = 'text'): AdfNode {
     return { type: 'codeBlock', attrs: { language }, content: [{ type: 'text', text: text || '(no output)' }] };
   },
+};
+
+// ADF rejects empty lists and empty text nodes, so always emit at least one placeholder item.
+function listItems(items: string[]): AdfNode[] {
+  const safe = items.length > 0 ? items : ['(none)'];
+  return safe.map((item) => ({
+    type: 'listItem',
+    content: [{ type: 'paragraph', content: [{ type: 'text', text: item || '(empty)' }] }],
+  }));
+}
+
+/** Appends a heading plus another ADF document's body to the end of a document. */
+function appendSection(doc: AdfNode, title: string, section: AdfNode): AdfNode {
+  const body = (doc.content as AdfNode[] | undefined) ?? [];
+  const extra = (section.content as AdfNode[] | undefined) ?? [];
+  return { ...doc, content: [...body, adf.heading(title), ...extra] };
+}
+
+export interface CreateIssueOptions {
+  summary: string;
+  description: AdfNode;
+  /** Jira "Environment" system field (ADF). If the project's screen lacks it, the content is appended to the description instead. */
+  environment?: AdfNode;
+  extraLabels?: string[];
+  /** Jira priority name (e.g. "High"); dropped automatically when the project's screen or scheme rejects it. */
+  priority?: string;
+  /** Severity level; written to the project's Severity custom field when one exists (see `JIRA_SEVERITY_FIELD`). */
+  severity?: string;
+}
+
+interface JiraFieldMeta {
+  id: string;
+  name: string;
+  custom?: boolean;
+  schema?: { type?: string; custom?: string };
+}
+
+interface SeverityField {
+  id: string;
+  name: string;
+  kind: 'option' | 'text';
+  options: Array<{ id: string; value: string }>;
+}
+
+// Accepted spellings per level so a project's own severity scale (S1-S4, Blocker/Major/Minor…) still maps.
+const SEVERITY_SYNONYMS: Record<string, string[]> = {
+  critical: ['critical', 'blocker', 'highest', 's1', 'sev1', 'sev-1', '1'],
+  high: ['high', 'major', 's2', 'sev2', 'sev-2', '2'],
+  medium: ['medium', 'moderate', 'normal', 's3', 'sev3', 'sev-3', '3'],
+  low: ['low', 'minor', 'trivial', 'lowest', 's4', 'sev4', 'sev-4', '4'],
 };
 
 interface SearchResponse {
@@ -99,6 +147,8 @@ export class JiraClient {
   private readonly siteUrl: string;
   private apiBase: string;
   private cloudId?: string;
+  private severityField?: SeverityField;
+  private severityLookup?: Promise<SeverityField | undefined>;
 
   constructor(private readonly config: JiraConfig) {
     this.authHeader = basicAuthHeader(config.email, config.apiToken);
@@ -218,21 +268,153 @@ export class JiraClient {
     return issue ? { key: issue.key, summary: issue.fields.summary, status: issue.fields.status.name } : undefined;
   }
 
-  async createIssue(summary: string, description: AdfNode, extraLabels: string[]): Promise<JiraIssueRef> {
-    const response = await requestJson<{ key: string }>(`${this.apiBase}/issue`, {
-      method: 'POST',
-      headers: { Authorization: this.authHeader },
-      body: {
-        fields: {
-          project: { key: this.config.projectKey },
-          issuetype: { name: this.config.issueType },
-          summary: summary.slice(0, 255),
-          description,
-          labels: [...new Set([...this.config.labels, ...extraLabels])],
-        },
-      },
-    });
+  async createIssue(options: CreateIssueOptions): Promise<JiraIssueRef> {
+    const { summary, description, environment, extraLabels = [], priority, severity } = options;
+    const fields: Record<string, unknown> = {
+      project: { key: this.config.projectKey },
+      issuetype: { name: this.config.issueType },
+      summary: summary.slice(0, 255),
+      description,
+      ...(environment ? { environment } : {}),
+      labels: [...new Set([...this.config.labels, ...extraLabels])],
+      ...(priority ? { priority: { name: priority } } : {}),
+      ...(await this.severityEntry(severity)),
+    };
+    const response = await this.sendFields<{ key: string }>(`${this.apiBase}/issue`, 'POST', fields);
     return { key: response.key, summary, status: 'new' };
+  }
+
+  /**
+   * Rewrites the standard bug report into the Description (and Environment) of an already-open
+   * defect, refreshing summary, labels, priority and severity, so the issue always shows the latest failure.
+   */
+  async updateIssue(key: string, options: CreateIssueOptions): Promise<void> {
+    const { summary, description, environment, extraLabels = [], priority, severity } = options;
+    const existingLabels = await this.getLabels(key);
+    const fields: Record<string, unknown> = {
+      summary: summary.slice(0, 255),
+      description,
+      ...(environment ? { environment } : {}),
+      labels: [...new Set([...existingLabels, ...this.config.labels, ...extraLabels])],
+      ...(priority ? { priority: { name: priority } } : {}),
+      ...(await this.severityEntry(severity)),
+    };
+    await this.sendFields(`${this.apiBase}/issue/${key}`, 'PUT', fields);
+  }
+
+  private async getLabels(key: string): Promise<string[]> {
+    const issue = await requestJson<{ fields?: { labels?: string[] } }>(`${this.apiBase}/issue/${key}?fields=labels`, {
+      headers: { Authorization: this.authHeader },
+    });
+    return issue.fields?.labels ?? [];
+  }
+
+  /**
+   * Optional fields degrade instead of losing the defect: priority or severity are dropped when the
+   * scheme rejects them, and an Environment the screen lacks is appended to the description.
+   */
+  private async sendFields<T>(url: string, method: 'POST' | 'PUT', fields: Record<string, unknown>): Promise<T> {
+    const send = (body: Record<string, unknown>) => requestJson<T>(url, { method, headers: { Authorization: this.authHeader }, body: { fields: body } });
+    let current = fields;
+    for (;;) {
+      try {
+        return await send(current);
+      } catch (error) {
+        if (!(error instanceof HttpError) || error.status !== 400) {
+          throw error;
+        }
+        if ('priority' in current && /priority/i.test(error.body)) {
+          warn('Jira rejected the priority field; retrying without it.');
+          const { priority: _dropped, ...rest } = current;
+          current = rest;
+          continue;
+        }
+        const severityId = this.severityField?.id;
+        if (severityId && severityId in current && error.body.includes(severityId)) {
+          warn(`Jira rejected the Severity field ${severityId} ("${this.severityField?.name}"); retrying without it. Add the field to the ${this.config.issueType} screen of project ${this.config.projectKey} to record severity.`);
+          const { [severityId]: _dropped, ...rest } = current;
+          current = rest;
+          continue;
+        }
+        if ('environment' in current && /environment/i.test(error.body)) {
+          warn('Jira rejected the Environment field (not on the issue screen); appending it to the description instead.');
+          const { environment, ...rest } = current;
+          current = { ...rest, description: appendSection(rest.description as AdfNode, 'Environment', environment as AdfNode) };
+          continue;
+        }
+        throw error;
+      }
+    }
+  }
+
+  /**
+   * Builds the `{ customfield_xxxxx: value }` entry for the Severity level, or `{}` when the project
+   * has no Severity field or none of its options match the level.
+   */
+  private async severityEntry(severity: string | undefined): Promise<Record<string, unknown>> {
+    if (!severity) {
+      return {};
+    }
+    const field = await this.resolveSeverityField();
+    if (!field) {
+      return {};
+    }
+    if (field.kind === 'text') {
+      return { [field.id]: severity };
+    }
+    const wanted = new Set([severity.toLowerCase(), ...(SEVERITY_SYNONYMS[severity.toLowerCase()] ?? [])]);
+    const option = field.options.find((candidate) => wanted.has(candidate.value.trim().toLowerCase()));
+    if (!option) {
+      warn(`Severity "${severity}" matches none of the options of Jira field "${field.name}" (${field.options.map((candidate) => candidate.value).join(', ') || 'no options visible'}); leaving the field unset.`);
+      return {};
+    }
+    return { [field.id]: { id: option.id } };
+  }
+
+  /**
+   * Severity is not a Jira system field. `JIRA_SEVERITY_FIELD` pins a custom field id; otherwise the
+   * field named "Severity" is used. Allowed options come from the project's create metadata.
+   */
+  private resolveSeverityField(): Promise<SeverityField | undefined> {
+    this.severityLookup ??= this.lookupSeverityField().catch((error) => {
+      warn('Could not resolve the Jira Severity field; severity will only be recorded as a label.', error);
+      return undefined;
+    });
+    return this.severityLookup;
+  }
+
+  private async lookupSeverityField(): Promise<SeverityField | undefined> {
+    const headers = { Authorization: this.authHeader };
+    const pinned = (process.env.JIRA_SEVERITY_FIELD ?? '').trim();
+    const all = await requestJson<JiraFieldMeta[]>(`${this.apiBase}/field`, { headers });
+    const meta = pinned
+      ? all.find((field) => field.id === pinned || field.name.toLowerCase() === pinned.toLowerCase())
+      : all.find((field) => field.custom && field.name.trim().toLowerCase() === 'severity') ?? all.find((field) => field.name.trim().toLowerCase() === 'severity');
+    if (!meta) {
+      warn(`No Jira field named "Severity" exists${pinned ? ` (and JIRA_SEVERITY_FIELD=${pinned} was not found)` : ''}; create a Severity select-list field on the ${this.config.issueType} screen or set JIRA_SEVERITY_FIELD. Severity is recorded as a label meanwhile.`);
+      return undefined;
+    }
+    const kind: SeverityField['kind'] = meta.schema?.type === 'string' ? 'text' : 'option';
+    const field: SeverityField = { id: meta.id, name: meta.name, kind, options: [] };
+    if (kind === 'option') {
+      const types = await requestJson<{ issueTypes?: Array<{ id: string; name: string }> }>(
+        `${this.apiBase}/issue/createmeta/${encodeURIComponent(this.config.projectKey)}/issuetypes?maxResults=50`,
+        { headers },
+      );
+      const type = types.issueTypes?.find((candidate) => candidate.name.toLowerCase() === this.config.issueType.toLowerCase());
+      if (type) {
+        const fields = await requestJson<{ fields?: Array<{ fieldId: string; allowedValues?: Array<{ id: string; value?: string; name?: string }> }> }>(
+          `${this.apiBase}/issue/createmeta/${encodeURIComponent(this.config.projectKey)}/issuetypes/${type.id}?maxResults=200`,
+          { headers },
+        );
+        field.options = (fields.fields?.find((candidate) => candidate.fieldId === meta.id)?.allowedValues ?? []).map((option) => ({
+          id: option.id,
+          value: option.value ?? option.name ?? '',
+        }));
+      }
+    }
+    this.severityField = field;
+    return field;
   }
 
   async addComment(key: string, body: AdfNode): Promise<void> {
@@ -243,13 +425,20 @@ export class JiraClient {
     });
   }
 
-  async addAttachment(key: string, filePath: string, contentType?: string): Promise<void> {
+  /** Replaces only the Description; used right after creation once evidence names (which carry the issue key) are known. */
+  async updateDescription(key: string, description: AdfNode): Promise<void> {
+    await this.sendFields(`${this.apiBase}/issue/${key}`, 'PUT', { description });
+  }
+
+  async addAttachment(key: string, filePath: string, contentType?: string, fileName?: string): Promise<void> {
     await uploadFile(
       `${this.apiBase}/issue/${key}/attachments`,
       filePath,
       'file',
       { Authorization: this.authHeader, 'X-Atlassian-Token': 'no-check' },
       contentType,
+      undefined,
+      fileName,
     );
   }
 }

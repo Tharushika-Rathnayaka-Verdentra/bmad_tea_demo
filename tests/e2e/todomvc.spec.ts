@@ -1,79 +1,89 @@
-import { test, expect, log } from '../support/merged-fixtures';
+﻿import { test, expect, log } from '../support/merged-fixtures';
 import { createTodo } from '../support/factories/todo-factory';
 
-test('@p1 [P1] 1.0-E2E-001 unique todo creation', async ({ page }) => {
+test('@p1 [P1] 1.0-E2E-001 unique todo creation', async ({ todoApp }) => {
   const todo = createTodo();
 
   await log.step('Given the TodoMVC app is open');
-  await page.goto('./');
+  await todoApp.open();
 
   await log.step('When a unique todo is created');
-  const newTodoInput = page.getByRole('textbox', { name: 'New Todo Input' });
-  await newTodoInput.fill(todo.title);
-  await newTodoInput.press('Enter');
+  const item = await todoApp.add(todo.title);
 
   await log.step('Then the todo appears exactly once as active');
-  const todoItems = page.getByRole('listitem').filter({ hasText: todo.title });
-  await expect(todoItems).toHaveCount(1);
-  await expect(todoItems.getByRole('checkbox')).not.toBeChecked();
+  await expect(item).toHaveCount(1);
+  await expect(todoApp.checkbox(todo.title)).not.toBeChecked();
 });
 
-test('@p1 [P1] 1.0-E2E-002 mixed active/completed todo membership through All, Active, Completed', async ({ page }) => {
+test('@p1 [P1] 1.0-E2E-002 mixed active/completed todo membership through All, Active, Completed', async ({ todoApp }) => {
   const activeTodo = createTodo();
   const completedTodo = createTodo();
 
   await log.step('Given the TodoMVC app is open');
-  await page.goto('./');
+  await todoApp.open();
 
   await log.step('When one todo is created and left active');
-  const newTodoInput = page.getByRole('textbox', { name: 'New Todo Input' });
-  await newTodoInput.fill(activeTodo.title);
-  await newTodoInput.press('Enter');
+  await todoApp.add(activeTodo.title);
 
   await log.step('And a second todo is created and marked completed');
-  await newTodoInput.fill(completedTodo.title);
-  await newTodoInput.press('Enter');
-  const completedItem = page.getByRole('listitem').filter({ hasText: completedTodo.title });
-  await completedItem.getByRole('checkbox').check();
-  await expect(completedItem.getByRole('checkbox')).toBeChecked();
+  await todoApp.add(completedTodo.title);
+  await todoApp.complete(completedTodo.title);
 
   await log.step('Then All view shows both todos');
-  await page.getByRole('link', { name: 'All' }).click();
-  await expect(page.getByRole('listitem').filter({ hasText: activeTodo.title })).toBeVisible();
-  await expect(page.getByRole('listitem').filter({ hasText: completedTodo.title })).toBeVisible();
+  await todoApp.filterBy('All');
+  await expect(todoApp.item(activeTodo.title)).toBeVisible();
+  await expect(todoApp.item(completedTodo.title)).toBeVisible();
 
   await log.step('And Active view shows only the active todo');
-  await page.getByRole('link', { name: 'Active' }).click();
-  await expect(page.getByRole('listitem').filter({ hasText: activeTodo.title })).toBeVisible();
-  await expect(page.getByRole('listitem').filter({ hasText: completedTodo.title })).not.toBeVisible();
+  await todoApp.filterBy('Active');
+  await expect(todoApp.item(activeTodo.title)).toBeVisible();
+  await expect(todoApp.item(completedTodo.title)).not.toBeVisible();
 
   await log.step('And Completed view shows only the completed todo');
-  await page.getByRole('link', { name: 'Completed' }).click();
-  await expect(page.getByRole('listitem').filter({ hasText: completedTodo.title })).toBeVisible();
-  await expect(page.getByRole('listitem').filter({ hasText: activeTodo.title })).not.toBeVisible();
-  await expect(completedItem.getByRole('checkbox')).toBeChecked();
+  await todoApp.filterBy('Completed');
+  await expect(todoApp.item(completedTodo.title)).toBeVisible();
+  await expect(todoApp.item(activeTodo.title)).not.toBeVisible();
+  await expect(todoApp.checkbox(completedTodo.title)).toBeChecked();
+});
+
+// Test design 1.0-E2E-003 (delete). Numbered 004 here because 1.0-E2E-003 is already carried by the
+// defect-pipeline probe below; renaming that test would break its TestRail case and Jira dedupe key.
+test('@p2 [P2] 1.0-E2E-004 deleting one todo removes only the selected row', async ({ todoApp }) => {
+  const keptTodo = createTodo();
+  const deletedTodo = createTodo();
+
+  await log.step('Given the TodoMVC app is open with two todos');
+  await todoApp.open();
+  await todoApp.addMany(keptTodo.title, deletedTodo.title);
+  await todoApp.expectRemainingCount(2);
+
+  await log.step('When one todo is deleted');
+  await todoApp.delete(deletedTodo.title);
+
+  await log.step('Then only the selected todo disappears and the other remains active');
+  await expect(todoApp.item(deletedTodo.title)).toHaveCount(0);
+  await expect(todoApp.item(keptTodo.title)).toHaveCount(1);
+  await expect(todoApp.checkbox(keptTodo.title)).not.toBeChecked();
+  await todoApp.expectRemainingCount(1);
 });
 
 // INTENTIONAL FAILURE — probes the TestRail/Jira defect pipeline. The final expectation is
-// deliberately wrong so the reporter raises (or comments on) a Jira issue for this test.
-// Fix the expectation to "1 item left" or delete this test once the integration is verified.
-test('@p2 [P2] 1.0-E2E-003 clearing completed todos keeps the active count accurate', async ({ page }) => {
+// deliberately wrong so the reporter raises (or updates) a Jira issue for this test.
+// Keep the title unchanged: the Jira dedupe label hashes project|file|title.
+// Fix the expectation to "1 item left" or delete this test once the integration is no longer being demoed.
+test('@p2 [P2] 1.0-E2E-003 clearing completed todos keeps the active count accurate', async ({ todoApp }) => {
   const activeTodo = createTodo();
   const completedTodo = createTodo();
 
   await log.step('Given the TodoMVC app is open with one active and one completed todo');
-  await page.goto('./');
-  const newTodoInput = page.getByRole('textbox', { name: 'New Todo Input' });
-  await newTodoInput.fill(activeTodo.title);
-  await newTodoInput.press('Enter');
-  await newTodoInput.fill(completedTodo.title);
-  await newTodoInput.press('Enter');
-  await page.getByRole('listitem').filter({ hasText: completedTodo.title }).getByRole('checkbox').check();
+  await todoApp.open();
+  await todoApp.addMany(activeTodo.title, completedTodo.title);
+  await todoApp.complete(completedTodo.title);
 
   await log.step('When completed todos are cleared');
-  await page.getByRole('button', { name: 'Clear completed' }).click();
-  await expect(page.getByRole('listitem').filter({ hasText: completedTodo.title })).toHaveCount(0);
+  await todoApp.clearCompleted();
+  await expect(todoApp.item(completedTodo.title)).toHaveCount(0);
 
   await log.step('Then the footer reports the remaining active todo count');
-  await expect(page.getByTestId('footer')).toContainText('2 items left');
+  await expect(todoApp.footer).toContainText('2 items left');
 });

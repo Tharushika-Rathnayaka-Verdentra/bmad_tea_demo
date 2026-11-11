@@ -6,12 +6,15 @@
   "scripts": {
     "test": "npm run test:e2e",
     "test:e2e": "playwright test",
+    "test:p1": "playwright test --grep @p1",
+    "test:p2": "playwright test --grep @p2",
     "test:e2e:headed": "playwright test --headed",
     "test:e2e:debug": "playwright test --debug",
     "test:ci": "playwright test --reporter=blob,list",
     "test:ci:merge": "playwright merge-reports --config playwright.config.ts",
     "test:all": "npm run test:e2e && npm run test:ci",
-    "test:burn-in": "playwright test --config tests/playwright.config.ts --repeat-each=5 --retries=0"
+    "test:burn-in": "playwright test --repeat-each=5 --retries=0 --reporter=list",
+    "typecheck": "tsc --noEmit"
   },
   "keywords": [],
   "type": "commonjs",

@@ -11,7 +11,9 @@ export default defineConfig({
   outputDir: './test-results',
   fullyParallel: true,
   forbidOnly: Boolean(process.env.CI),
-  retries: process.env.CI ? 2 : 0,
+  // A failed test is retried 3 times (4 runs in total). The TestRail/Jira reporter only raises a
+  // defect when every attempt failed; a pass on any retry is reported as flaky instead.
+  retries: Number(process.env.PW_RETRIES ?? 3),
   workers: process.env.CI ? 1 : undefined,
   reporter: [
     ['html', { outputFolder: 'playwright-report', open: 'never' }],
@@ -30,7 +32,8 @@ export default defineConfig({
     navigationTimeout: 30_000,
     trace: 'retain-on-failure-and-retries',
     screenshot: 'only-on-failure',
-    video: 'retain-on-failure',
+    // Recording only from the first retry keeps green runs cheap; failures still ship a video to the bug report.
+    video: 'on-first-retry',
   },
   projects: [
     {

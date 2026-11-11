@@ -55,9 +55,10 @@ export async function uploadFile<T>(
   headers: Record<string, string>,
   contentType = 'application/octet-stream',
   timeoutMs = 60_000,
+  fileName = basename(filePath),
 ): Promise<T> {
   const form = new FormData();
-  form.append(fieldName, new Blob([readFileSync(filePath)], { type: contentType }), basename(filePath));
+  form.append(fieldName, new Blob([readFileSync(filePath)], { type: contentType }), fileName);
 
   const response = await fetch(url, {
     method: 'POST',

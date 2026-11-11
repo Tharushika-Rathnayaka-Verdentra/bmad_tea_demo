@@ -9,27 +9,32 @@ The default `BASE_URL` is `https://todomvc.com/examples/react/dist/`. The root `
 ## Running
 
 - `npm run test:e2e` runs the suite headlessly.
+- `npm run test:p1` / `npm run test:p2` run only tests tagged `@p1` / `@p2` (selective execution).
 - `npm run test:e2e:headed` runs with a visible browser.
 - `npm run test:e2e:debug` opens Playwright Inspector.
+- `npm run typecheck` runs `tsc --noEmit` over the config and tests.
 - `npx playwright show-report` opens the latest HTML report.
 
-The config writes HTML output to `playwright-report/`, JUnit XML, failure artifacts and the TestRail/Jira sync manifest to `test-results/`.
+The config writes HTML output to `playwright-report/`, JUnit XML, failure artifacts, the TestRail/Jira sync manifest and renamed evidence copies (`test-results/evidence/`) to `test-results/`. Video is recorded from the first retry onwards (`video: 'on-first-retry'`), so green runs skip recording while every failed test still attaches a video to its bug report.
 
 ## Structure
 
 - `tests/e2e/` contains browser journeys.
 - `tests/api/` contains request-level availability checks.
 - `tests/support/merged-fixtures.ts` is the single test import for Playwright and `@seontechnologies/playwright-utils` fixtures.
+- `tests/support/todo-app-fixture.ts` provides the `todoApp` fixture — a small role-based driver for the TodoMVC UI (`open`, `add`, `complete`, `delete`, `clearCompleted`, `filterBy`, `expectRemainingCount`). Specs compose actions from it instead of repeating locator boilerplate.
 - `tests/support/factories/` contains data factories.
 - `tests/support/reporters/` contains the TestRail + Jira reporter and its REST clients.
 
 The TodoMVC UI has no documented app API or authentication flow. Its example uses accessible roles and names because the live app does not expose test IDs. The request-level example checks only the supplied root URL; no API endpoint or network interception behavior is assumed.
 
+`tests/e2e/todomvc.spec.ts` deliberately keeps one failing test (`1.0-E2E-003 clearing completed todos…`) as a probe for the Jira defect pipeline. Its title must not change: the reporter's Jira dedupe label hashes `project|file|title`, so a rename files a fresh defect instead of updating the existing one. The delete scenario from the test design is therefore numbered `1.0-E2E-004`.
+
 ## Conventions
 
 Keep tests isolated, use web-first locator assertions, and avoid fixed waits. Interceptors should be declared before navigation when a real app request is under test. Use a project-owned test ID only when the application exposes one.
 
-The auth fixture is inactive unless a test requests `authToken`; its provider intentionally throws because TodoMVC has no authentication configured. Set up an application-specific provider before using authenticated tests.
+The auth fixture is inactive unless a test requests `authToken`; its provider intentionally throws because TodoMVC has no authentication configured. Set up an application-specific provider before using authenticated tests. The fixture keeps the library's `authOptions`, `authSessionEnabled` and `authToken` fixtures but deliberately does not use its `context`/`page` overrides: those call `browser.newContext()` directly and silently drop `recordVideo`, device emulation and other `use` options. When auth is enabled, the storage state is injected through Playwright's native `storageState` option instead.
 
 This VS Code/Copilot environment does not provide the Claude Code write-time hook used by the TEA workflow; run the test-review workflow to assess test-quality rules.
 
@@ -39,11 +44,11 @@ This VS Code/Copilot environment does not provide the Claude Code write-time hoo
 
 Jobs:
 
-- **burn-in** (pull requests only) diffs the PR against its base, and runs any added or modified `tests/**/*.spec.ts` five times with retries disabled via `npm run test:burn-in`. It is skipped when no spec changed.
+- **burn-in** (pull requests only) diffs the PR against its base, and runs any added or modified `tests/**/*.spec.ts` five times with retries disabled via `npm run test:burn-in`. The script uses the root `playwright.config.ts` with the `list` reporter only, so burn-in iterations never reach TestRail or Jira. It is skipped when no spec changed.
 - **e2e** runs the full suite in two shards with `fail-fast: false`, using the blob reporter so results can be merged.
 - **report** merges the shard blobs into the HTML and JUnit reports defined in `playwright.config.ts`, verifies the TestRail/Jira sync manifest (see below), uploads the reports as `playwright-report` and `junit-results` (30-day retention), and fails if any shard failed.
 
-The config already sets `forbidOnly`, `retries: 2`, and `workers: 1` when `CI` is set. No secrets are required; `BASE_URL` defaults to the public TodoMVC site. Override it with a repository variable or workflow `env` entry when pointing at another environment.
+The config already sets `forbidOnly` and `workers: 1` when `CI` is set, and `retries: 3` everywhere (override with `PW_RETRIES`). No secrets are required; `BASE_URL` defaults to the public TodoMVC site. Override it with a repository variable or workflow `env` entry when pointing at another environment.
 
 Local parity:
 
@@ -59,9 +64,32 @@ Shard count is set in the workflow `SHARD_TOTAL` env and matrix; raise both toge
 
 `tests/support/reporters/testrail-jira-reporter.ts` is registered in `playwright.config.ts`. After every run it:
 
-1. Writes `test-results/testrail-jira-sync.json` — a manifest of every test's outcome, error, screenshot path, TestRail case/run ids and Jira keys. This is always written, even without credentials.
+1. Writes `test-results/testrail-jira-sync.json` — a manifest of every test's outcome, error, steps, artifact paths, TestRail case/run ids, Jira keys and (for failures) the standard bug report. This is always written, even without credentials.
 2. When TestRail credentials are set, ensures the section `TESTRAIL_SECTION_NAME` exists in project `TESTRAIL_PROJECT_ID`, looks up each test case by its cleaned title and **creates missing cases**, creates a run (or reuses `TESTRAIL_RUN_ID`), and posts results: passed → Passed, failed → Failed, flaky → Retest (`TESTRAIL_FLAKY_STATUS_ID`), skipped → untested unless `TESTRAIL_SKIPPED_STATUS_ID` is set. Failure screenshots are attached to the result.
-3. When Jira credentials are set, first verifies them (`GET /myself`) and that `JIRA_PROJECT_KEY` is visible to that user, then **raises a `JIRA_ISSUE_TYPE` in `JIRA_PROJECT_KEY` for each failed test**. Each test carries a stable label (`pw-test-<hash>`); if an open issue with that label already exists the reporter comments on it instead of creating a duplicate. The Jira key is written into the TestRail result's `defects` field. `sync.jira` is `done` only when every failed test ended up with a Jira key; a rejected token (HTTP 401), an unknown project or any defect that could not be created marks it `failed`.
+3. When Jira credentials are set, first verifies them (`GET /myself`) and that `JIRA_PROJECT_KEY` is visible to that user, then **raises a `JIRA_ISSUE_TYPE` in `JIRA_PROJECT_KEY` for each test that failed on every attempt**. A failed test is retried 3 times (`retries: 3` in `playwright.config.ts`, override with `PW_RETRIES`), so a defect requires 4 consecutive failures (`JIRA_MIN_FAILED_ATTEMPTS`, default 4); a test that passes on any retry is flaky — TestRail gets a Retest result and no Jira issue is created. Runs executed with fewer retries than the threshold (e.g. `--retries=0`) log the failure but do not file a bug. Each test carries a stable label (`pw-test-<hash>`); if an open issue with that label already exists the reporter rewrites that issue's **Description** (plus summary, labels and priority) with the latest standard bug report instead of creating a duplicate or adding a comment. The Jira key is written into the TestRail result's `defects` field. `sync.jira` is `done` only when every qualifying failure ended up with a Jira key; a rejected token (HTTP 401), an unknown project or any defect that could not be created marks it `failed`.
+
+### Standard bug report scope
+
+Every Jira defect follows the same standard scope, built by `tests/support/reporters/bug-report.ts` and stored per failed test as `bugReport` in the sync manifest so the MCP path can file an identical report. The **Summary** carries the Bug Title, the **Environment** field carries the environment facts, **Priority** and **Severity** are set as issue fields, and the **Description** carries the rest:
+
+| Jira field / section | Source |
+| --- | --- |
+| Summary (**Bug Title**) | `[Automated] <test title without tags>` — not repeated in the Description |
+| Priority field | From the title tag, mapped to Jira's default scheme: `@p0`/`[P0]` → Highest, P1 → High, P2 → Medium, P3 → Low (default Medium); override with a `priority` annotation. Dropped with a warning if the project's scheme rejects it |
+| Severity field | Same tag: P0 → Critical, P1 → High, P2 → Medium, P3 → Low (default Medium); override with a `severity` annotation. Written to the custom field named **Severity** (or the one in `JIRA_SEVERITY_FIELD`), matching its options case-insensitively and via common synonyms (Blocker/Major/Minor, S1–S4). Always also added as a `severity-<level>` label, which is the fallback when the project has no Severity field |
+| Environment — **Tested Environment** | `TEST_ENV` (default `local`) |
+| Environment — **Tested URL** | The project's `baseURL` |
+| Environment — **Release No.** | `RELEASE_NO`, else `<package.json version>+<short git sha>` |
+| Environment — **Tested Devices** | `TESTED_DEVICES`, else `<project>: <viewport> desktop|mobile on <OS> (<arch>)` |
+| Environment — **Tested Browsers** | `TESTED_BROWSERS`, else the bundled browser and version, e.g. `Chromium 158.0.8127.18` |
+| Description — opening paragraph (no heading) | A narrative summary of the Steps to Reproduce: the steps that passed, the expectation that did not hold, the error, and how many attempts reproduced it |
+| Description — **Pre-requisites** | Checkout instructions plus any `test.info().annotations.push({ type: 'prerequisite', description })` |
+| Description — **Steps to Reproduce** | Every `log.step(...)` / `test.step(...)` in order; the failing step is marked `❌ (fails here)`. Falls back to the replay command when a test has no steps |
+| Description — **Actual Result** | Failing step + the matcher's `Received …` line, followed by the full Playwright error as a code block |
+| Description — **Expected Result** | Failing step + the matcher's `Expected …` line |
+| Description — **Evidence** | Trace, screenshot and video of the final attempt, saved to `test-results/evidence/` and attached to the issue as `{Bug ID}_{Story ID}_Trace_{yyyyMMdd_HHmmss}.zip`, `{Bug ID}_{Story ID}_Image_{yyyyMMdd_HHmmss}.png` (and `…_Video_….webm`), where the timestamp is the local failure time of the last attempt; plus spec location, replay command, CI run, TestRail case and run links. Story ID is a `story` annotation or `@story:<id>` title tag, else the `{epic}.{story}` prefix of the plan id (`1.0-E2E-003` → `1.0`), else `NA` |
+
+If the project's Bug screen does not include the Environment field, Jira rejects it and the reporter retries with the same five lines appended to the Description under an **Environment** heading, so nothing is lost.
 
 Credentials come from `.env` locally (see `.env.example`) or from repository secrets in CI. Variable names match the TestRail MCP server, so one `.env` configures both. `JIRA_BASE_URL` is the Jira site URL (for example `https://your-site.atlassian.net`), not the Atlassian MCP endpoint. `JIRA_PROJECT_KEY` is the short project **key** shown in issue keys (`SCRUM` for `SCRUM-12`), not the project name — Jira Cloud answers JQL for anonymous callers, so a wrong key or a revoked token used to surface only as a misleading HTTP 400 on issue creation; the reporter now fails the Jira sync up front instead. The TestRail user must hold a role that can add sections and cases in the target project (the default **Tester** role cannot; **Lead** can) — otherwise the sync fails with HTTP 403 on `add_section`/`add_case`. `TESTRAIL_SECTION_NAME` is a *section* inside project `TESTRAIL_PROJECT_ID`, not the project name; it is created on first use. `TESTRAIL_SUITE_ID` must be a suite **of that project** (TestRail → project → Test Suites, or `get_suites/<project id>`): the reporter validates it before syncing, falls back to the project's only suite when the id is wrong or unset in a multi-suite project, and otherwise fails with the list of valid suite ids instead of TestRail's opaque `Field :suite_id is not a valid test suite` 400.
 

@@ -1,4 +1,4 @@
----
+﻿---
 stepsCompleted: ['step-01-preflight-and-context', 'step-02-identify-targets', 'step-03-generate-tests', 'step-03c-aggregate', 'step-04-validate-and-summarize']
 lastStep: 'step-04-validate-and-summarize'
 lastSaved: '2026-11-11'
@@ -15,6 +15,10 @@ inputDocuments:
   - '.env.example'
   - '.github/workflows/e2e-tests.yml'
   - 'test-results/testrail-jira-sync.json'
+  - 'tests/support/auth-fixture.ts'
+  - 'tests/support/todo-app-fixture.ts'
+  - 'tests/api/site-availability.spec.ts'
+  - '_bmad-output/test-artifacts/test-review.md'
 ---
 
 # Test Automation: Epic 1 P0/P1
@@ -74,7 +78,7 @@ No P0 cases are defined in the plan. P2 deletion and target-availability coverag
 - Scope: every run must end with results stored in TestRail as a test run. No new product tests were requested; the target is the reporting pipeline in `tests/support/reporters/`.
 - Root causes found:
   1. `.env` did not exist; `playwright.config.ts` loads only `.env`, and the credentials had been written into the tracked `.env.example`, so the reporter never saw them.
-  2. The TestRail user held the **Tester** role, which cannot add sections or cases → HTTP 403 on `add_section` once credentials were loaded.
+  2. The TestRail user held the **Tester** role, which cannot add sections or cases â†’ HTTP 403 on `add_section` once credentials were loaded.
   3. `TESTRAIL_SECTION_NAME` was set to the project name (`Automation Test Suite`); no such section existed.
   4. The uncommitted CI workflow had regressed `${{ secrets.X }}` to literal `process.env.X` strings, so CI sync could never authenticate.
   5. The `refs` regex `[A-Z]+` could not match plan ids containing digits (`1.0-E2E-001`), so traceability refs never reached TestRail.
@@ -97,7 +101,7 @@ No P0 cases are defined in the plan. P2 deletion and target-availability coverag
 - `.env.example`: API key blanked, `TESTRAIL_REQUIRED` documented; `.env` (gitignored) created locally with the real values.
 - `.github/workflows/e2e-tests.yml`: GitHub Actions expression syntax restored for all TestRail/Jira env entries.
 - `README.md`: `.env` vs `.env.example` loading rule, role requirement, section-vs-project note, `TESTRAIL_REQUIRED`, refs backfill.
-- TestRail (out-of-repo, with user approval): user role changed Tester → Lead via `update_user/1`; section `Automation Test Suite` and cases C2011–C2013 created by the reporter.
+- TestRail (out-of-repo, with user approval): user role changed Tester â†’ Lead via `update_user/1`; section `Automation Test Suite` and cases C2011â€“C2013 created by the reporter.
 - No product tests, fixtures, factories or package scripts were added or changed.
 
 ## Validation
@@ -114,7 +118,7 @@ No P0 cases are defined in the plan. P2 deletion and target-availability coverag
 ## Assumptions and Risks
 
 - Jira sync remains skipped (`JIRA_API_TOKEN` empty); not in scope for this request.
-- `TESTRAIL_SUITE_ID=1` is set although project 1 is single-suite mode; TestRail accepts it. Remove it if the project is ever switched to multi-suite with a different master suite id. **(Materialized on 2026-11-11 — see the addendum below.)**
+- `TESTRAIL_SUITE_ID=1` is set although project 1 is single-suite mode; TestRail accepts it. Remove it if the project is ever switched to multi-suite with a different master suite id. **(Materialized on 2026-11-11 â€” see the addendum below.)**
 - Each local run creates a new TestRail run; set `TESTRAIL_RUN_ID` to accumulate results into one run.
 - The committed API key in git history must be rotated; this cannot be fixed by a working-tree change.
 
@@ -125,7 +129,7 @@ No P0 cases are defined in the plan. P2 deletion and target-availability coverag
 - `bmad-testarch-trace` to refresh the traceability matrix now that TestRail cases carry plan refs.
 ---
 
-## Addendum 2026-11-11: TestRail sync failure (suite id) — fixed
+## Addendum 2026-11-11: TestRail sync failure (suite id) â€” fixed
 
 ### Preflight and Context
 
@@ -135,12 +139,12 @@ No P0 cases are defined in the plan. P2 deletion and target-availability coverag
 ### Root Cause
 
 - `.env` had drifted to `TESTRAIL_PROJECT_ID=3` + `TESTRAIL_SUITE_ID=3` (the previous manifest shows an earlier attempt with suite `1`). `.env.example` already carried the correct `10`.
-- `get_project/3` → `suite_mode: 3` (multiple suites, so `suite_id` is mandatory); `get_suites/3` → exactly one suite, **id 10 "Master"**. Suite 3 belongs to another project.
+- `get_project/3` â†’ `suite_mode: 3` (multiple suites, so `suite_id` is mandatory); `get_suites/3` â†’ exactly one suite, **id 10 "Master"**. Suite 3 belongs to another project.
 
 ### Changes
 
 - `.env` (gitignored): `TESTRAIL_SUITE_ID=10`; removed the duplicated `TESTRAIL_REQUIRED` block.
-- `tests/support/reporters/testrail-client.ts`: `TestRailProject`/`TestRailSuite` types, `getProject()`, `getSuites()`, `suiteId` getter and `resolveSuite()` — validates the configured suite against the project, self-heals to the project's only suite (wrong id, or unset in a multi-suite project), otherwise throws listing the valid suite ids.
+- `tests/support/reporters/testrail-client.ts`: `TestRailProject`/`TestRailSuite` types, `getProject()`, `getSuites()`, `suiteId` getter and `resolveSuite()` â€” validates the configured suite against the project, self-heals to the project's only suite (wrong id, or unset in a multi-suite project), otherwise throws listing the valid suite ids.
 - `tests/support/reporters/testrail-jira-reporter.ts`: `syncCasesAndRun` calls `resolveSuite(info)` first; the resolved suite id is written to the manifest; a 400 mentioning `suite_id` now prints a config hint next to the existing 403 hint.
 - `README.md`: suite-id requirement and the new validation behaviour documented.
 
@@ -148,9 +152,67 @@ No P0 cases are defined in the plan. P2 deletion and target-availability coverag
 
 - `npx tsc --noEmit`: passed.
 - `npx playwright test`: 3 passed; cases mapped 3 (3 created in section "Automation Test Suite", suite 10); **TestRail run #33** created, 3 results posted; manifest `sync.testrail: done`, `suiteId: 10`; exit 0.
-- Regression replay with the broken config (`TESTRAIL_SUITE_ID=3`, `TESTRAIL_RUN_ID=33`): reporter logged `TESTRAIL_SUITE_ID=3 does not belong to project 3 "Automation Test Suite"; using its only suite 10 "Master"`, mapped 3 cases (0 created — title dedupe holds), re-posted into run 33; exit 0.
+- Regression replay with the broken config (`TESTRAIL_SUITE_ID=3`, `TESTRAIL_RUN_ID=33`): reporter logged `TESTRAIL_SUITE_ID=3 does not belong to project 3 "Automation Test Suite"; using its only suite 10 "Master"`, mapped 3 cases (0 created â€” title dedupe holds), re-posted into run 33; exit 0.
 
 ### Assumptions and Risks
 
 - `.env.example` (tracked, currently modified in the working tree) contains a real `TESTRAIL_API_KEY`. Blank it before committing and rotate the key; the reporter and MCP server only need the key in the gitignored `.env`.
 - Multi-suite projects with more than one suite still require an explicit, correct `TESTRAIL_SUITE_ID`; the reporter will name the candidates rather than guess.
+
+---
+
+# Run 3: Suite Optimization (2026-11-11)
+
+## Preflight and Context
+
+- Mode: Standalone (request: "optimize the current project and then finally run"); stack `frontend`, root `playwright.config.ts` and dependencies present, `tea_use_playwright_utils: true` with the package installed.
+- Baseline: 4 tests — 3 passing, 1 intentional defect-pipeline probe (`1.0-E2E-003 clearing completed…`) failing on every attempt (4 × ~13 s). Test design `1.0-E2E-003` (delete, P2) was still unimplemented; the test review flagged the API test as untagged.
+- User decisions: keep the probe failing (still demoing Jira); switch `video` to `on-first-retry`; let the final run sync to TestRail/Jira.
+- Knowledge loaded: core set plus Playwright Utils mandate, fixtures composition, network-error-monitor, burn-in, network-first/fixture-architecture principles.
+
+## Identified Targets
+
+| Target | Level | Priority | Outcome |
+| --- | --- | --- | --- |
+| Duplicated add/complete/locator boilerplate across specs | Infra | P1 | New `todoApp` fixture (`tests/support/todo-app-fixture.ts`) merged via `mergeTests` |
+| Slow `load` event caused by Google Tag Manager (3+ s per page) | Perf | P1 | Third-party analytics blocked in the fixture (`page.route` on non-app traffic — a permitted exception under the mandate) |
+| Planned-but-missing delete scenario (design `1.0-E2E-003`) | E2E | P2 | Implemented as `1.0-E2E-004` (ID 003 is held by the probe; renaming it would break its TestRail case and Jira dedupe key, which hashes `project|file|title`) |
+| API test lacked priority tag / plan ID | API | P2 | Retitled `@p2 [P2] 1.0-API-001 …` (new TestRail case C2021) |
+| `test:burn-in` pointed at non-existent `tests/playwright.config.ts` | CI | P1 | Uses root config, `--reporter=list` so burn-in iterations never reach TestRail/Jira |
+| No selective-run scripts | Ops | P3 | `test:p1`, `test:p2`, `typecheck` scripts |
+| Video recorded for every test and discarded on pass | Perf | P2 | `video: 'on-first-retry'`; reporter borrows the first-retry video when the final attempt has none |
+| **Video never reached bug reports** (pre-existing) | Reporter | P1 | Root cause: playwright-utils `createAuthFixtures().context` calls `browser.newContext()` directly, bypassing Playwright's context fixture and dropping `recordVideo` and device `use` options. Fixed by dropping those overrides and injecting auth storage via the native `storageState` option |
+
+## Generated / Updated Files
+
+- `tests/support/todo-app-fixture.ts` (new): `TodoApp` driver (`open`, `item`, `checkbox`, `add`, `addMany`, `complete`, `delete`, `clearCompleted`, `filterBy`, `expectRemainingCount`) + `todoApp` fixture with analytics blocking.
+- `tests/support/merged-fixtures.ts`: merges `todoAppFixture`; re-exports `TodoApp`/`TodoFilter` types.
+- `tests/support/auth-fixture.ts`: keeps `authOptions`/`authSessionEnabled`/`authToken`; removes library `context`/`page` overrides; adds `storageState` override.
+- `tests/e2e/todomvc.spec.ts`: all four scenarios on `todoApp`; new `1.0-E2E-004` delete scenario; probe title/steps unchanged.
+- `tests/api/site-availability.spec.ts`: tagged `@p2 [P2] 1.0-API-001`.
+- `tests/support/reporters/testrail-jira-reporter.ts`: evidence collection falls back to the most recent attempt carrying a video.
+- `playwright.config.ts`: `video: 'on-first-retry'`.
+- `package.json`: `test:p1`, `test:p2`, `typecheck`; `test:burn-in` fixed.
+- `README.md`: scripts, fixture, probe-title rule, burn-in reporter note, auth-fixture rationale.
+
+## Validation
+
+- `npx tsc --noEmit`: passed.
+- Green subset (`1.0-E2E-001/002/004`, `1.0-API-001`, sync disabled): 4 passed — wall time 20.9 s → 10.0 s after analytics blocking; per-test 10–17 s → 4–6 s.
+- Video A/B probe: vanilla `test` recorded `video.webm`, merged `test` did not; bisect isolated `authFixture`. After the fix, `--retries=1` run produced `…-retry1/video.webm` (472 KB).
+- Final `npx playwright test` with sync: 4 passed, probe failed ×4 (exit 1 by design). TestRail cases mapped 5 (C2018–C2022), **run #62** updated, 5 results posted; **Jira SCRUM-5** updated with Image + Trace + **Video** evidence (first run to carry video); manifest `sync: { testrail: done, jira: done }`.
+- Test quality: role/name locators, web-first assertions inside the driver, no hard waits, independent contexts, factory-generated titles.
+- Playwright Utils deviations: `tests/support/auth-fixture.ts:30`: library `context`/`page` fixtures intentionally not used — they bypass Playwright's context fixture and lose video/device options; auth storage goes through the native `storageState` option. `tests/support/todo-app-fixture.ts:78`: `page.route` aborts Google Tag Manager/Analytics only (non-app traffic, permitted exception).
+- Pact.js Utils: N/A (no contract artifacts).
+
+## Assumptions and Risks
+
+- Retitled tests created new TestRail cases (C2021 `1.0-API-001`, C2022 `1.0-E2E-004`); the old untitled availability case remains in the section and can be retired manually.
+- The probe test still exits the run with code 1 by design; CI will stay red until it is fixed to `1 item left` or removed.
+- `test:all` runs the suite twice (`test:e2e` then `test:ci`); left unchanged, candidate for removal.
+- Upstream issue worth reporting to `@seontechnologies/playwright-utils`: `createAuthFixtures().context` should extend Playwright's `context` fixture (or pass `recordVideo` and `use` options) instead of calling `browser.newContext()` with `browser._options.contextOptions`.
+
+## Next Recommended Workflow
+
+- `bmad-testarch-test-review` on the refactored specs and new fixture.
+- `bmad-testarch-trace` to map `1.0-E2E-004` to E1-R4 and refresh the matrix now that every test carries a plan ID.

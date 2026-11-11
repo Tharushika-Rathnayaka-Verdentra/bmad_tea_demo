@@ -4,7 +4,21 @@ import { dirname, join, relative } from 'node:path';
 import process from 'node:process';
 import type { FullConfig, FullResult, Reporter, Suite, TestCase, TestResult } from '@playwright/test/reporter';
 import { HttpError, info, warn } from './http-client';
-import { adf, ATLASSIAN_TOKEN_URL, JiraAuthError, JiraClient, type JiraConfig } from './jira-client';
+import {
+  buildBugReport,
+  evidenceFileLines,
+  extractReproSteps,
+  nameEvidenceFiles,
+  renderBugReport,
+  renderEnvironment,
+  saveEvidenceFiles,
+  storyIdFor,
+  type EvidenceAttachment,
+  type EvidenceKind,
+  type ReproStep,
+  type StandardBugReport,
+} from './bug-report';
+import { ATLASSIAN_TOKEN_URL, JiraAuthError, JiraClient, type JiraConfig } from './jira-client';
 import { TESTRAIL_STATUS, TestRailClient, type TestRailConfig, type TestRailResultInput } from './testrail-client';
 
 type Outcome = 'passed' | 'failed' | 'flaky' | 'skipped';
@@ -24,9 +38,18 @@ interface CollectedTest {
   attempts: number;
   error?: string;
   screenshot?: string;
+  /** ISO time the final attempt failed; drives the evidence file timestamp. */
+  failedAt?: string;
+  steps: ReproStep[];
+  annotations: Array<{ type: string; description?: string }>;
+  attachments: EvidenceAttachment[];
+  /** Evidence saved as `{Bug ID}_{Story ID}_{Kind}_{timestamp}` once the Jira key is known. */
+  evidenceFiles?: Array<{ kind: EvidenceKind; fileName: string; path: string }>;
+  /** Standard bug scope; present for failed tests only so MCP-driven sync can file the same report. */
+  bugReport?: StandardBugReport;
   caseId?: number;
   jiraKey?: string;
-  jiraAction?: 'created' | 'commented';
+  jiraAction?: 'created' | 'updated';
 }
 
 interface SyncManifest {
@@ -36,12 +59,19 @@ interface SyncManifest {
   sync: { testrail: 'done' | 'skipped' | 'failed'; jira: 'done' | 'skipped' | 'failed' };
   summary: Record<Outcome, number>;
   testrail: { projectId?: number; suiteId?: number; sectionName: string; runId?: number; runUrl?: string };
-  jira: { projectKey: string; apiBase?: string; authError?: string; issues: Array<{ key: string; url: string; action: string; test: string }> };
+  jira: {
+    projectKey: string;
+    apiBase?: string;
+    authError?: string;
+    issues: Array<{ key: string; url: string; action: string; test: string; severity: string; priority: string }>;
+  };
   tests: CollectedTest[];
 }
 
 export interface ReporterOptions {
   manifestPath?: string;
+  /** Where renamed evidence copies are written; defaults to `test-results/evidence`. */
+  evidenceDir?: string;
 }
 
 const env = (name: string, fallback = ''): string => (process.env[name] ?? fallback).trim();
@@ -50,6 +80,8 @@ const optIn = (name: string): boolean => ['true', '1', 'yes', 'on'].includes(env
 const intOrUndefined = (value: string): number | undefined => (value && /^\d+$/.test(value) ? Number(value) : undefined);
 
 const TESTRAIL_CREDENTIAL_VARS = ['TESTRAIL_INSTANCE_URL', 'TESTRAIL_USERNAME', 'TESTRAIL_API_KEY'] as const;
+/** First run + 3 retries must all fail before a defect is raised. */
+const DEFAULT_MIN_FAILED_ATTEMPTS = 4;
 const SECRET_VARS = ['TESTRAIL_API_KEY', 'JIRA_API_TOKEN'] as const;
 
 /**
@@ -172,6 +204,7 @@ function toElapsed(durationMs: number): string {
 
 export default class TestRailJiraReporter implements Reporter {
   private readonly manifestPath: string;
+  private readonly evidenceDir: string;
   private readonly sectionName = env('TESTRAIL_SECTION_NAME', 'Automation Test Suite');
   private readonly lastResults = new Map<string, TestResult>();
   private config!: FullConfig;
@@ -179,6 +212,7 @@ export default class TestRailJiraReporter implements Reporter {
 
   constructor(options: ReporterOptions = {}) {
     this.manifestPath = options.manifestPath ?? join('test-results', 'testrail-jira-sync.json');
+    this.evidenceDir = options.evidenceDir ?? join('test-results', 'evidence');
   }
 
   printsToStdio(): boolean {
@@ -200,10 +234,22 @@ export default class TestRailJiraReporter implements Reporter {
       return undefined;
     }
 
+    const generatedAt = new Date().toISOString();
+    const baseURL = this.config.projects[0]?.use.baseURL;
+    const runUrl = ciRunUrl();
+    for (const test of tests.filter((entry) => entry.outcome === 'failed')) {
+      test.bugReport = buildBugReport(test, {
+        baseURL,
+        ciRunUrl: runUrl,
+        failedAt: generatedAt,
+        projectUse: this.config.projects.find((project) => project.name === test.project)?.use,
+      });
+    }
+
     const manifest: SyncManifest = {
-      generatedAt: new Date().toISOString(),
-      baseURL: this.config.projects[0]?.use.baseURL,
-      ciRunUrl: ciRunUrl(),
+      generatedAt,
+      baseURL,
+      ciRunUrl: runUrl,
       sync: { testrail: 'skipped', jira: 'skipped' },
       summary: this.summarize(tests),
       testrail: { sectionName: this.sectionName },
@@ -315,6 +361,27 @@ export default class TestRailJiraReporter implements Reporter {
       const screenshot = result?.attachments.find(
         (attachment) => attachment.contentType === 'image/png' && attachment.path && existsSync(attachment.path),
       )?.path;
+      type Attachment = TestResult['attachments'][number];
+      const hasFile = (attachment: Attachment): attachment is Attachment & { path: string } =>
+        Boolean(attachment.path && existsSync(attachment.path));
+      const toEvidence = (attachment: Attachment & { path: string }): EvidenceAttachment => ({
+        name: attachment.name,
+        path: attachment.path,
+        contentType: attachment.contentType,
+      });
+      const attachments: EvidenceAttachment[] = (result?.attachments ?? [])
+        .filter(hasFile)
+        .filter((attachment) => ['screenshot', 'trace', 'video'].includes(attachment.name))
+        .map(toEvidence);
+      // With `video: 'on-first-retry'` only the first retry records; borrow its video when the final attempt has none.
+      if (!attachments.some((attachment) => attachment.name === 'video')) {
+        const video = [...test.results]
+          .reverse()
+          .flatMap((run) => run.attachments)
+          .filter(hasFile)
+          .find((attachment) => attachment.name === 'video');
+        if (video) attachments.push(toEvidence(video));
+      }
 
       return {
         key: createHash('sha1').update(`${project}|${file}|${titleChain}`).digest('hex').slice(0, 12),
@@ -332,6 +399,10 @@ export default class TestRailJiraReporter implements Reporter {
         attempts: test.results.length,
         error: toOutcome(test) === 'failed' ? formatError(result) : undefined,
         screenshot,
+        failedAt: result ? new Date(result.startTime.getTime() + result.duration).toISOString() : undefined,
+        steps: extractReproSteps(result),
+        annotations: test.annotations.map((annotation) => ({ type: annotation.type, description: annotation.description })),
+        attachments,
       };
     });
   }
@@ -408,57 +479,80 @@ export default class TestRailJiraReporter implements Reporter {
     await jira.verifyProject();
     info(`Jira authenticated as ${me.displayName}; defects go to project ${manifest.jira.projectKey}.`);
 
-    const failures = tests.filter((test) => test.outcome === 'failed');
+    // Playwright marks a test "failed" only when every attempt (first run + retries) failed; a pass on
+    // any retry yields "flaky", which never raises a defect. The threshold additionally guards against
+    // runs executed with fewer retries than the policy requires (e.g. `--retries=0`).
+    const minAttempts = intOrUndefined(env('JIRA_MIN_FAILED_ATTEMPTS')) ?? DEFAULT_MIN_FAILED_ATTEMPTS;
+    const allFailed = tests.filter((test) => test.outcome === 'failed');
+    const failures = allFailed.filter((test) => test.attempts >= minAttempts);
+    for (const test of allFailed.filter((test) => test.attempts < minAttempts)) {
+      info(`No Jira defect for "${test.caseTitle}": it failed ${test.attempts} time(s) but ${minAttempts} consecutive failures are required (set retries to ${minAttempts - 1} or adjust JIRA_MIN_FAILED_ATTEMPTS).`);
+    }
+    const flaky = tests.filter((test) => test.outcome === 'flaky');
+    if (flaky.length > 0) {
+      info(`${flaky.length} test(s) passed on retry and are reported as flaky; no Jira defects raised for them.`);
+    }
     if (failures.length === 0) {
-      info('No failed tests; no Jira defects raised.');
+      info('No tests failed on every attempt; no Jira defects raised.');
       return 0;
     }
 
     let unsynced = 0;
     for (const test of failures) {
       const dedupeLabel = `pw-test-${test.key}`;
-      const summary = `[Automated] ${test.caseTitle}`;
-      const details = [
-        `Spec: ${test.file}:${test.line}`,
-        `Project: ${test.project}`,
-        `Attempts: ${test.attempts}`,
-        `Duration: ${toElapsed(test.durationMs)}`,
-        `Base URL: ${manifest.baseURL ?? 'n/a'}`,
+      const report = test.bugReport!;
+      // TestRail ids are only known after the case/run sync, so they join the evidence here.
+      report.evidence.push(
         ...(test.caseId && testRail ? [`TestRail case: ${testRail.caseUrl(test.caseId)}`] : []),
         ...(runId && testRail ? [`TestRail run: ${testRail.runUrl(runId)}`] : []),
-        ...(manifest.ciRunUrl ? [`CI run: ${manifest.ciRunUrl}`] : []),
-      ];
-      const errorBlock = adf.codeBlock(test.error ?? '');
+      );
 
       try {
         const existing = await jira.findOpenIssueByLabel(dedupeLabel);
-        if (existing) {
-          await jira.addComment(
-            existing.key,
-            adf.doc(adf.paragraph(`Automated test failed again on ${manifest.generatedAt}.`), adf.bulletList(details), errorBlock),
-          );
-          test.jiraKey = existing.key;
-          test.jiraAction = 'commented';
-        } else {
-          const issue = await jira.createIssue(
-            summary,
-            adf.doc(
-              adf.paragraph(`The automated Playwright test "${test.titlePath}" failed.`),
-              adf.heading('Context'),
-              adf.bulletList(details),
-              adf.heading('Error'),
-              errorBlock,
-            ),
-            [dedupeLabel],
-          );
-          test.jiraKey = issue.key;
+        const issueFields = {
+          summary: report.bugTitle,
+          description: renderBugReport(report),
+          environment: renderEnvironment(report.environment),
+          extraLabels: [dedupeLabel, `severity-${report.severity.toLowerCase()}`],
+          priority: report.priority,
+          severity: report.severity,
+        };
+        if (!existing) {
+          test.jiraKey = (await jira.createIssue(issueFields)).key;
           test.jiraAction = 'created';
+        } else {
+          test.jiraKey = existing.key;
+          test.jiraAction = 'updated';
         }
-        if (test.screenshot) {
-          await jira.addAttachment(test.jiraKey, test.screenshot, 'image/png').catch((error) => warn(`Screenshot upload to ${test.jiraKey} failed.`, error));
+
+        // Evidence names carry the Bug ID, so they are assigned (and the files saved) only now.
+        const storyId = storyIdFor(test);
+        const files = nameEvidenceFiles(test.attachments, test.jiraKey, storyId, new Date(test.failedAt ?? manifest.generatedAt));
+        const savedPaths = saveEvidenceFiles(files, this.evidenceDir);
+        test.evidenceFiles = files.map((file, index) => ({ kind: file.kind, fileName: file.fileName, path: savedPaths[index] }));
+        report.evidence.unshift(...evidenceFileLines(files));
+        const description = renderBugReport(report);
+
+        if (existing) {
+          // Keep the report in the Description (not a comment) so the issue always shows the latest failure.
+          await jira.updateIssue(existing.key, { ...issueFields, description });
+        } else if (files.length > 0) {
+          await jira.updateDescription(test.jiraKey, description);
         }
-        manifest.jira.issues.push({ key: test.jiraKey, url: jira.issueUrl(test.jiraKey), action: test.jiraAction, test: test.caseTitle });
-        info(`Jira ${test.jiraAction}: ${jira.issueUrl(test.jiraKey)} for "${test.caseTitle}"`);
+        for (const [index, file] of files.entries()) {
+          await jira
+            .addAttachment(test.jiraKey, savedPaths[index], file.contentType, file.fileName)
+            .catch((error) => warn(`${file.kind} upload (${file.fileName}) to ${test.jiraKey} failed.`, error));
+        }
+        manifest.jira.issues.push({
+          key: test.jiraKey,
+          url: jira.issueUrl(test.jiraKey),
+          action: test.jiraAction,
+          test: test.caseTitle,
+          severity: report.severity,
+          priority: report.priority,
+        });
+        info(`Jira ${test.jiraAction}: ${jira.issueUrl(test.jiraKey)} for "${test.caseTitle}" (severity ${report.severity}, priority ${report.priority}; evidence: ${files.map((file) => file.fileName).join(', ') || 'none'})`);
       } catch (error) {
         unsynced += 1;
         warn(`Jira defect handling failed for "${test.caseTitle}".`, error);
@@ -511,8 +605,9 @@ export default class TestRailJiraReporter implements Reporter {
     await Promise.all(
       reportable.map(async (test, index) => {
         const resultId = posted[index]?.id;
-        if (test.outcome === 'failed' && test.screenshot && resultId) {
-          await testRail.addAttachmentToResult(resultId, test.screenshot, 'image/png').catch((error) => warn(`Screenshot upload for case C${test.caseId} failed.`, error));
+        const image = test.evidenceFiles?.find((file) => file.kind === 'Image')?.path ?? test.screenshot;
+        if (test.outcome === 'failed' && image && resultId) {
+          await testRail.addAttachmentToResult(resultId, image, 'image/png').catch((error) => warn(`Screenshot upload for case C${test.caseId} failed.`, error));
         }
       }),
     );
