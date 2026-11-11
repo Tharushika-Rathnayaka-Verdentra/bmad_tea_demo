@@ -8,6 +8,20 @@ export interface TestRailConfig {
   suiteId?: number;
 }
 
+// suite_mode: 1 single suite, 2 single suite + baselines, 3 multiple suites (suite_id mandatory).
+export interface TestRailProject {
+  id: number;
+  name: string;
+  suite_mode: 1 | 2 | 3;
+}
+
+export interface TestRailSuite {
+  id: number;
+  name: string;
+  project_id: number;
+  is_master?: boolean;
+}
+
 export interface TestRailSection {
   id: number;
   name: string;
@@ -70,6 +84,47 @@ export class TestRailClient {
 
   get projectId(): number {
     return this.config.projectId;
+  }
+
+  get suiteId(): number | undefined {
+    return this.config.suiteId;
+  }
+
+  async getProject(): Promise<TestRailProject> {
+    return this.get<TestRailProject>(`get_project/${this.config.projectId}`);
+  }
+
+  async getSuites(): Promise<TestRailSuite[]> {
+    return this.getAll<'suites', TestRailSuite>('suites', `get_suites/${this.config.projectId}`);
+  }
+
+  // Validates TESTRAIL_SUITE_ID against the project before any section/case/run call. A suite id
+  // from another project yields an opaque "Field :suite_id is not a valid test suite" 400 otherwise.
+  async resolveSuite(log: (message: string) => void = () => undefined): Promise<number | undefined> {
+    const [project, suites] = await Promise.all([this.getProject(), this.getSuites()]);
+    const configured = this.config.suiteId;
+    const ids = suites.map((suite) => `${suite.id} (${suite.name})`).join(', ') || 'none';
+
+    if (configured && suites.some((suite) => suite.id === configured)) {
+      return configured;
+    }
+    if (configured) {
+      if (suites.length === 1) {
+        log(`TESTRAIL_SUITE_ID=${configured} does not belong to project ${project.id} "${project.name}"; using its only suite ${suites[0].id} "${suites[0].name}".`);
+        this.config.suiteId = suites[0].id;
+        return this.config.suiteId;
+      }
+      throw new Error(`TESTRAIL_SUITE_ID=${configured} does not belong to project ${project.id} "${project.name}". Valid suite ids: ${ids}.`);
+    }
+    if (project.suite_mode !== 3) {
+      return undefined;
+    }
+    if (suites.length === 1) {
+      log(`Project ${project.id} "${project.name}" uses multiple suites; TESTRAIL_SUITE_ID is unset so using its only suite ${suites[0].id} "${suites[0].name}".`);
+      this.config.suiteId = suites[0].id;
+      return this.config.suiteId;
+    }
+    throw new Error(`Project ${project.id} "${project.name}" uses multiple suites; set TESTRAIL_SUITE_ID to one of: ${ids}.`);
   }
 
   runUrl(runId: number): string {

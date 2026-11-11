@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import process from 'node:process';
 import type { FullConfig, FullResult, Reporter, Suite, TestCase, TestResult } from '@playwright/test/reporter';
 import { HttpError, info, warn } from './http-client';
-import { adf, JiraClient, type JiraConfig } from './jira-client';
+import { adf, ATLASSIAN_TOKEN_URL, JiraAuthError, JiraClient, type JiraConfig } from './jira-client';
 import { TESTRAIL_STATUS, TestRailClient, type TestRailConfig, type TestRailResultInput } from './testrail-client';
 
 type Outcome = 'passed' | 'failed' | 'flaky' | 'skipped';
@@ -36,7 +36,7 @@ interface SyncManifest {
   sync: { testrail: 'done' | 'skipped' | 'failed'; jira: 'done' | 'skipped' | 'failed' };
   summary: Record<Outcome, number>;
   testrail: { projectId?: number; suiteId?: number; sectionName: string; runId?: number; runUrl?: string };
-  jira: { projectKey: string; issues: Array<{ key: string; url: string; action: string; test: string }> };
+  jira: { projectKey: string; apiBase?: string; authError?: string; issues: Array<{ key: string; url: string; action: string; test: string }> };
   tests: CollectedTest[];
 }
 
@@ -50,6 +50,36 @@ const optIn = (name: string): boolean => ['true', '1', 'yes', 'on'].includes(env
 const intOrUndefined = (value: string): number | undefined => (value && /^\d+$/.test(value) ? Number(value) : undefined);
 
 const TESTRAIL_CREDENTIAL_VARS = ['TESTRAIL_INSTANCE_URL', 'TESTRAIL_USERNAME', 'TESTRAIL_API_KEY'] as const;
+const SECRET_VARS = ['TESTRAIL_API_KEY', 'JIRA_API_TOKEN'] as const;
+
+/**
+ * `.env.example` is tracked, so a secret pasted there is committed (and, for Atlassian tokens,
+ * revoked automatically once the commit is scanned). Report it before the first API call so the
+ * resulting 401 is not mistaken for a code or configuration bug. Values are compared, never printed.
+ */
+export function secretHygieneWarnings(examplePath = '.env.example', environment: NodeJS.ProcessEnv = process.env): string[] {
+  if (!existsSync(examplePath)) {
+    return [];
+  }
+  const warnings: string[] = [];
+  const lines = readFileSync(examplePath, 'utf8').split(/\r?\n/);
+  for (const name of SECRET_VARS) {
+    const line = lines.find((entry) => entry.startsWith(`${name}=`));
+    const value = line?.slice(name.length + 1).trim().replace(/^["']|["']$/g, '') ?? '';
+    if (!value) {
+      continue;
+    }
+    const live = (environment[name] ?? '').trim();
+    if (live && value === live) {
+      warnings.push(
+        `${name} in ${examplePath} is the same secret that is in use now. ${examplePath} is tracked by git, so treat this credential as compromised: revoke it, create a new one, keep it only in .env or CI secrets, and blank the value in ${examplePath}.`,
+      );
+    } else {
+      warnings.push(`${name} has a value in ${examplePath}, which is tracked by git. Keep secrets only in .env (gitignored) or CI secrets and blank this value.`);
+    }
+  }
+  return warnings;
+}
 
 // playwright.config.ts only loads `.env`; a populated `.env.example` alone is the most common reason the sync is skipped.
 function testRailSkipReason(): string {
@@ -142,7 +172,7 @@ function toElapsed(durationMs: number): string {
 
 export default class TestRailJiraReporter implements Reporter {
   private readonly manifestPath: string;
-  private readonly sectionName = env('TESTRAIL_SECTION_NAME', 'Playwright Automation');
+  private readonly sectionName = env('TESTRAIL_SECTION_NAME', 'Automation Test Suite');
   private readonly lastResults = new Map<string, TestResult>();
   private config!: FullConfig;
   private suite!: Suite;
@@ -196,6 +226,9 @@ export default class TestRailJiraReporter implements Reporter {
     if (!jira) {
       info('Jira defect sync skipped: set JIRA_BASE_URL, JIRA_EMAIL and JIRA_API_TOKEN to enable.');
     }
+    for (const warning of secretHygieneWarnings()) {
+      warn(warning);
+    }
 
     // Write early so the manifest exists for MCP-driven sync even if the API calls below fail.
     this.writeManifest(manifest);
@@ -204,6 +237,7 @@ export default class TestRailJiraReporter implements Reporter {
     if (testRail) {
       try {
         runId = await this.syncCasesAndRun(testRail, tests);
+        manifest.testrail.suiteId = testRail.suiteId;
         manifest.testrail.runId = runId;
         manifest.testrail.runUrl = testRail.runUrl(runId);
       } catch (error) {
@@ -211,16 +245,29 @@ export default class TestRailJiraReporter implements Reporter {
         if (error instanceof HttpError && error.status === 403) {
           warn('The TestRail user needs a role that can add sections and cases (e.g. Lead) in the target project, or pin tests to existing cases with @C<id>.');
         }
+        if (error instanceof HttpError && error.status === 400 && /suite_id/.test(error.body)) {
+          warn('Check TESTRAIL_PROJECT_ID / TESTRAIL_SUITE_ID: the suite must belong to the project (multi-suite projects require a suite id).');
+        }
         manifest.sync.testrail = 'failed';
       }
     }
 
     if (jira) {
       try {
-        await this.syncDefects(jira, tests, manifest, testRail, runId);
-        manifest.sync.jira = 'done';
+        const unsynced = await this.syncDefects(jira, tests, manifest, testRail, runId);
+        manifest.sync.jira = unsynced === 0 ? 'done' : 'failed';
+        if (unsynced > 0) {
+          warn(`${unsynced} failed test(s) have no Jira defect; marking Jira sync as failed.`);
+        }
       } catch (error) {
         warn('Jira defect sync failed.', error);
+        // JiraAuthError already carries the full diagnosis; a bare 401 here means the token died mid-run.
+        if (error instanceof HttpError && error.status === 401) {
+          warn(`Jira rejected the credentials (HTTP 401) after authentication had succeeded. Create a new token at ${ATLASSIAN_TOKEN_URL} and update JIRA_API_TOKEN in .env or the CI secret.`);
+        }
+        if (error instanceof JiraAuthError) {
+          manifest.jira.authError = error.message;
+        }
         manifest.sync.jira = 'failed';
       }
     }
@@ -298,6 +345,7 @@ export default class TestRailJiraReporter implements Reporter {
   }
 
   private async syncCasesAndRun(testRail: TestRailClient, tests: CollectedTest[]): Promise<number> {
+    await testRail.resolveSuite(info);
     const section = await testRail.ensureSection(this.sectionName);
     const existingCases = await testRail.getCasesInSection(section.id);
     const byTitle = new Map(existingCases.map((testCase) => [testCase.title, testCase]));
@@ -343,19 +391,30 @@ export default class TestRailJiraReporter implements Reporter {
     return run.id;
   }
 
+  /** Returns the number of failed tests that ended up without a Jira defect. */
   private async syncDefects(
     jira: JiraClient,
     tests: CollectedTest[],
     manifest: SyncManifest,
     testRail: TestRailClient | undefined,
     runId: number | undefined,
-  ): Promise<void> {
+  ): Promise<number> {
+    // Verify credentials and project on every run so broken integration config is caught by green runs too.
+    const me = await jira.verifyAuth();
+    manifest.jira.apiBase = jira.restBase;
+    if (me.viaGateway) {
+      info(`Jira token is scoped; using the api.atlassian.com gateway (${jira.restBase}) for this site.`);
+    }
+    await jira.verifyProject();
+    info(`Jira authenticated as ${me.displayName}; defects go to project ${manifest.jira.projectKey}.`);
+
     const failures = tests.filter((test) => test.outcome === 'failed');
     if (failures.length === 0) {
       info('No failed tests; no Jira defects raised.');
-      return;
+      return 0;
     }
 
+    let unsynced = 0;
     for (const test of failures) {
       const dedupeLabel = `pw-test-${test.key}`;
       const summary = `[Automated] ${test.caseTitle}`;
@@ -401,9 +460,11 @@ export default class TestRailJiraReporter implements Reporter {
         manifest.jira.issues.push({ key: test.jiraKey, url: jira.issueUrl(test.jiraKey), action: test.jiraAction, test: test.caseTitle });
         info(`Jira ${test.jiraAction}: ${jira.issueUrl(test.jiraKey)} for "${test.caseTitle}"`);
       } catch (error) {
+        unsynced += 1;
         warn(`Jira defect handling failed for "${test.caseTitle}".`, error);
       }
     }
+    return unsynced;
   }
 
   private async syncResults(

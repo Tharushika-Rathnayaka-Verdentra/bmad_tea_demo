@@ -1,7 +1,7 @@
 ---
 stepsCompleted: ['step-01-preflight-and-context', 'step-02-identify-targets', 'step-03-generate-tests', 'step-03c-aggregate', 'step-04-validate-and-summarize']
 lastStep: 'step-04-validate-and-summarize'
-lastSaved: '2026-11-10'
+lastSaved: '2026-11-11'
 inputDocuments:
   - '_bmad/tea/config.yaml'
   - '_bmad-output/test-artifacts/test-design-epic-1.md'
@@ -75,7 +75,7 @@ No P0 cases are defined in the plan. P2 deletion and target-availability coverag
 - Root causes found:
   1. `.env` did not exist; `playwright.config.ts` loads only `.env`, and the credentials had been written into the tracked `.env.example`, so the reporter never saw them.
   2. The TestRail user held the **Tester** role, which cannot add sections or cases → HTTP 403 on `add_section` once credentials were loaded.
-  3. `TESTRAIL_SECTION_NAME` was set to the project name (`Test-Tharushika`); no such section existed.
+  3. `TESTRAIL_SECTION_NAME` was set to the project name (`Automation Test Suite`); no such section existed.
   4. The uncommitted CI workflow had regressed `${{ secrets.X }}` to literal `process.env.X` strings, so CI sync could never authenticate.
   5. The `refs` regex `[A-Z]+` could not match plan ids containing digits (`1.0-E2E-001`), so traceability refs never reached TestRail.
 - Security: a live TestRail API key was committed in `.env.example` (present in `HEAD`). It was removed from the tracked file; the key is in git history and **must be rotated** in TestRail.
@@ -97,7 +97,7 @@ No P0 cases are defined in the plan. P2 deletion and target-availability coverag
 - `.env.example`: API key blanked, `TESTRAIL_REQUIRED` documented; `.env` (gitignored) created locally with the real values.
 - `.github/workflows/e2e-tests.yml`: GitHub Actions expression syntax restored for all TestRail/Jira env entries.
 - `README.md`: `.env` vs `.env.example` loading rule, role requirement, section-vs-project note, `TESTRAIL_REQUIRED`, refs backfill.
-- TestRail (out-of-repo, with user approval): user role changed Tester → Lead via `update_user/1`; section `Test-Tharushika` and cases C2011–C2013 created by the reporter.
+- TestRail (out-of-repo, with user approval): user role changed Tester → Lead via `update_user/1`; section `Automation Test Suite` and cases C2011–C2013 created by the reporter.
 - No product tests, fixtures, factories or package scripts were added or changed.
 
 ## Validation
@@ -114,7 +114,7 @@ No P0 cases are defined in the plan. P2 deletion and target-availability coverag
 ## Assumptions and Risks
 
 - Jira sync remains skipped (`JIRA_API_TOKEN` empty); not in scope for this request.
-- `TESTRAIL_SUITE_ID=1` is set although project 1 is single-suite mode; TestRail accepts it. Remove it if the project is ever switched to multi-suite with a different master suite id.
+- `TESTRAIL_SUITE_ID=1` is set although project 1 is single-suite mode; TestRail accepts it. Remove it if the project is ever switched to multi-suite with a different master suite id. **(Materialized on 2026-11-11 — see the addendum below.)**
 - Each local run creates a new TestRail run; set `TESTRAIL_RUN_ID` to accumulate results into one run.
 - The committed API key in git history must be rotated; this cannot be fixed by a working-tree change.
 
@@ -123,3 +123,34 @@ No P0 cases are defined in the plan. P2 deletion and target-availability coverag
 - Rotate the TestRail API key, update `.env`, and commit the sanitized `.env.example` + workflow fix.
 - Add `TESTRAIL_*` repository secrets/variables so the `report` job publishes CI runs (its verify step will now fail loudly if the sync does not complete).
 - `bmad-testarch-trace` to refresh the traceability matrix now that TestRail cases carry plan refs.
+---
+
+## Addendum 2026-11-11: TestRail sync failure (suite id) — fixed
+
+### Preflight and Context
+
+- Mode: Standalone (request: "run the current project and fix the TestRail errors"); stack `frontend`, Playwright config and dependencies present.
+- Baseline run: 3 passed, but `[testrail-jira-reporter] TestRail case/run sync failed. HTTP 400 ... get_sections/3&suite_id=3: {"error":"Field :suite_id is not a valid test suite."}`; `TESTRAIL_REQUIRED=true` correctly turned the run red (exit 1).
+
+### Root Cause
+
+- `.env` had drifted to `TESTRAIL_PROJECT_ID=3` + `TESTRAIL_SUITE_ID=3` (the previous manifest shows an earlier attempt with suite `1`). `.env.example` already carried the correct `10`.
+- `get_project/3` → `suite_mode: 3` (multiple suites, so `suite_id` is mandatory); `get_suites/3` → exactly one suite, **id 10 "Master"**. Suite 3 belongs to another project.
+
+### Changes
+
+- `.env` (gitignored): `TESTRAIL_SUITE_ID=10`; removed the duplicated `TESTRAIL_REQUIRED` block.
+- `tests/support/reporters/testrail-client.ts`: `TestRailProject`/`TestRailSuite` types, `getProject()`, `getSuites()`, `suiteId` getter and `resolveSuite()` — validates the configured suite against the project, self-heals to the project's only suite (wrong id, or unset in a multi-suite project), otherwise throws listing the valid suite ids.
+- `tests/support/reporters/testrail-jira-reporter.ts`: `syncCasesAndRun` calls `resolveSuite(info)` first; the resolved suite id is written to the manifest; a 400 mentioning `suite_id` now prints a config hint next to the existing 403 hint.
+- `README.md`: suite-id requirement and the new validation behaviour documented.
+
+### Validation
+
+- `npx tsc --noEmit`: passed.
+- `npx playwright test`: 3 passed; cases mapped 3 (3 created in section "Automation Test Suite", suite 10); **TestRail run #33** created, 3 results posted; manifest `sync.testrail: done`, `suiteId: 10`; exit 0.
+- Regression replay with the broken config (`TESTRAIL_SUITE_ID=3`, `TESTRAIL_RUN_ID=33`): reporter logged `TESTRAIL_SUITE_ID=3 does not belong to project 3 "Automation Test Suite"; using its only suite 10 "Master"`, mapped 3 cases (0 created — title dedupe holds), re-posted into run 33; exit 0.
+
+### Assumptions and Risks
+
+- `.env.example` (tracked, currently modified in the working tree) contains a real `TESTRAIL_API_KEY`. Blank it before committing and rotate the key; the reporter and MCP server only need the key in the gitignored `.env`.
+- Multi-suite projects with more than one suite still require an explicit, correct `TESTRAIL_SUITE_ID`; the reporter will name the candidates rather than guess.

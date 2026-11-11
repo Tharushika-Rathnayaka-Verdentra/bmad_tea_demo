@@ -53,3 +53,27 @@ test('@p1 [P1] 1.0-E2E-002 mixed active/completed todo membership through All, A
   await expect(page.getByRole('listitem').filter({ hasText: activeTodo.title })).not.toBeVisible();
   await expect(completedItem.getByRole('checkbox')).toBeChecked();
 });
+
+// INTENTIONAL FAILURE — probes the TestRail/Jira defect pipeline. The final expectation is
+// deliberately wrong so the reporter raises (or comments on) a Jira issue for this test.
+// Fix the expectation to "1 item left" or delete this test once the integration is verified.
+test('@p2 [P2] 1.0-E2E-003 clearing completed todos keeps the active count accurate', async ({ page }) => {
+  const activeTodo = createTodo();
+  const completedTodo = createTodo();
+
+  await log.step('Given the TodoMVC app is open with one active and one completed todo');
+  await page.goto('./');
+  const newTodoInput = page.getByRole('textbox', { name: 'New Todo Input' });
+  await newTodoInput.fill(activeTodo.title);
+  await newTodoInput.press('Enter');
+  await newTodoInput.fill(completedTodo.title);
+  await newTodoInput.press('Enter');
+  await page.getByRole('listitem').filter({ hasText: completedTodo.title }).getByRole('checkbox').check();
+
+  await log.step('When completed todos are cleared');
+  await page.getByRole('button', { name: 'Clear completed' }).click();
+  await expect(page.getByRole('listitem').filter({ hasText: completedTodo.title })).toHaveCount(0);
+
+  await log.step('Then the footer reports the remaining active todo count');
+  await expect(page.getByTestId('footer')).toContainText('2 items left');
+});
